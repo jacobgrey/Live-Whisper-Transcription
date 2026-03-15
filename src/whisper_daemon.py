@@ -6,13 +6,39 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from faster_whisper import WhisperModel
+import shutil
 import sounddevice as sd
 import numpy as np
 import soundfile as sf
 from datetime import datetime
 import time
 import os
+
+# ---------------------------------------------------------------------------
+# Windows symlink workaround — non-admin users lack SeCreateSymbolicLinkPrivilege,
+# which breaks huggingface_hub's cache (it relies on symlinks).  Patch os.symlink
+# to fall back to copying so the model downloads work without elevated privileges.
+# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    _original_symlink = os.symlink
+
+    def _symlink_or_copy(src, dst, target_is_directory=False, **kw):
+        try:
+            _original_symlink(src, dst, target_is_directory=target_is_directory, **kw)
+        except OSError:
+            src_path = Path(src) if not isinstance(src, Path) else src
+            dst_path = Path(dst) if not isinstance(dst, Path) else dst
+            # Resolve relative symlink targets against the destination's parent
+            if not src_path.is_absolute():
+                src_path = (dst_path.parent / src_path).resolve()
+            if src_path.is_dir():
+                shutil.copytree(str(src_path), str(dst_path))
+            else:
+                shutil.copy2(str(src_path), str(dst_path))
+
+    os.symlink = _symlink_or_copy
+
+from faster_whisper import WhisperModel
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -32,7 +58,78 @@ _recording = False
 _audio = []
 _stop = threading.Event()
 _shutdown = threading.Event()
+_input_device = None          # None = system default; int device index
 job_lock = threading.Lock()
+
+DEVICE_CONFIG = PROJECT_ROOT / "input_device.txt"
+
+
+def _load_device_pref():
+    """Load saved input device preference from input_device.txt."""
+    global _input_device
+    if DEVICE_CONFIG.exists():
+        raw = DEVICE_CONFIG.read_text().strip()
+        if raw == "" or raw.lower() == "default":
+            _input_device = None
+        else:
+            try:
+                _input_device = int(raw)
+            except ValueError:
+                _input_device = None
+    else:
+        _input_device = None
+
+
+def _save_device_pref(device_index):
+    """Persist the device preference to input_device.txt."""
+    DEVICE_CONFIG.write_text(str(device_index) if device_index is not None else "default")
+
+
+def _select_device_interactive():
+    """Show input devices in the console and let the user pick one."""
+    global _input_device
+    devices = sd.query_devices()
+    input_devs = []
+    default_idx = sd.default.device[0]  # system default input device index
+    for i, d in enumerate(devices):
+        if d['max_input_channels'] > 0:
+            marker = " (system default)" if i == default_idx else ""
+            input_devs.append((i, d['name'], marker))
+
+    print("\n=== Input Device Selection ===")
+    print("  0: System default")
+    for idx, (dev_idx, name, marker) in enumerate(input_devs, 1):
+        print(f"  {idx}: [{dev_idx}] {name}{marker}")
+
+    current = _input_device
+    if current is None:
+        print(f"\nCurrently using: System default")
+    else:
+        print(f"\nCurrently using: device index {current}")
+
+    print()
+    while True:
+        choice = input("Enter number (0 for system default, or press Enter to keep current): ").strip()
+        if choice == "":
+            break
+        try:
+            n = int(choice)
+        except ValueError:
+            print("Please enter a number.")
+            continue
+        if n == 0:
+            _input_device = None
+            _save_device_pref(None)
+            print("Set to system default.\n")
+            break
+        if 1 <= n <= len(input_devs):
+            dev_idx = input_devs[n - 1][0]
+            dev_name = input_devs[n - 1][1]
+            _input_device = dev_idx
+            _save_device_pref(dev_idx)
+            print(f"Set to: [{dev_idx}] {dev_name}\n")
+            break
+        print(f"Please enter 0-{len(input_devs)}.")
 
 
 def log(msg):
@@ -117,7 +214,8 @@ def rec_loop():
         if _recording:
             _audio.append(indata.copy())
 
-    with sd.InputStream(samplerate=16000, channels=1, callback=cb):
+    with sd.InputStream(samplerate=16000, channels=1, callback=cb,
+                        device=_input_device):
         _stop.wait()
 
     log("Mic stream closed")
@@ -143,6 +241,7 @@ def STOP():
     _recording = False
     _stop.set()
     if not _audio:
+        log("WARNING: No audio detected — mic may be muted or wrong device selected")
         return "OK "
     audio = np.concatenate(_audio, axis=0).astype(np.float32)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -151,6 +250,8 @@ def STOP():
         seg, _ = _model.transcribe(f.name, language=_language, vad_filter=True)
         txt = " ".join(s.text.strip() for s in seg)
         log(f"Mic transcription done in {time.time() - t0:.2f}s")
+        if not txt.strip():
+            log("WARNING: No speech detected in recorded audio")
     return "OK " + txt
 
 
@@ -507,6 +608,18 @@ def client(c):
 
 
 def main():
+    _load_device_pref()
+
+    if "--select-device" in sys.argv:
+        _select_device_interactive()
+    else:
+        if _input_device is not None:
+            dev_name = sd.query_devices(_input_device)['name']
+            log(f"Input device: [{_input_device}] {dev_name}")
+        else:
+            log("Input device: system default")
+        log("Tip: Launch with Shift+F7 to select a different input device.")
+
     load_model()
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -12,6 +12,7 @@ hf_token.txt
 __pycache__/
 constraints.txt
 python_installed.txt
+input_device.txt
 
 # Downloaded tools (ffmpeg installed by setup.cmd)
 tools/

@@ -11,6 +11,12 @@ F7::
     Run('cmd /c ""' daemonCmd '""')
 }
 
+; Start daemon with input device selection
++F7::
+{
+    Run('cmd /c ""' daemonCmd '" --select-device"')
+}
+
 F8::
 {
     global py, client
