@@ -66,7 +66,7 @@ if not defined EXTRACTED (
 
 rem Copy project files into current directory (where setup.cmd lives)
 rem This overwrites existing project files with the latest versions
-rem User-specific files (hf_token.txt, venv/, constraints.txt) are not in the repo
+rem User-specific files (config/hf_token.txt, venv/, config/constraints.txt) are not in the repo
 xcopy "!EXTRACTED!\*" "%ROOT%\" /e /y /q >nul
 del "!ZIP_FILE!" >nul 2>&1
 rmdir /s /q "!EXTRACT_DIR!" >nul 2>&1
@@ -302,14 +302,14 @@ echo.
 rem --- Check if core deps need updating ---
 set "NEED_CORE_DEPS=1"
 if exist "%ROOT%\venv\.deps_core_installed" (
-    fc /b "%ROOT%\requirements.txt" "%ROOT%\venv\.deps_core_installed" >nul 2>&1
+    fc /b "%ROOT%\config\requirements.txt" "%ROOT%\venv\.deps_core_installed" >nul 2>&1
     if not errorlevel 1 set "NEED_CORE_DEPS=0"
 )
 
 rem --- Check if diarization deps need updating ---
 set "NEED_DIAR_DEPS=1"
 if exist "%ROOT%\venv\.deps_diarize_installed" (
-    fc /b "%ROOT%\requirements-diarize.txt" "%ROOT%\venv\.deps_diarize_installed" >nul 2>&1
+    fc /b "%ROOT%\config\requirements-diarize.txt" "%ROOT%\venv\.deps_diarize_installed" >nul 2>&1
     if not errorlevel 1 set "NEED_DIAR_DEPS=0"
 )
 
@@ -328,7 +328,7 @@ if "%NEED_VENV%"=="1" (
             echo torch==2.7.1+cu118
             echo torchvision==0.22.1+cu118
             echo torchaudio==2.7.1+cu118
-        ) > "%ROOT%\constraints.txt"
+        ) > "%ROOT%\config\constraints.txt"
     ) else (
         echo Installing CPU-only PyTorch (this may take several minutes^)...
         pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
@@ -337,7 +337,7 @@ if "%NEED_VENV%"=="1" (
             pause
             exit /b 1
         )
-        pip freeze | findstr /i "^torch" > "%ROOT%\constraints.txt"
+        pip freeze | findstr /i "^torch" > "%ROOT%\config\constraints.txt"
     )
     echo.
 )
@@ -345,13 +345,13 @@ if "%NEED_VENV%"=="1" (
 rem --- Install core dependencies ---
 if "%NEED_CORE_DEPS%"=="1" (
     echo Installing core dependencies...
-    pip install -c "%ROOT%\constraints.txt" -r "%ROOT%\requirements.txt"
+    pip install -c "%ROOT%\config\constraints.txt" -r "%ROOT%\config\requirements.txt"
     if errorlevel 1 (
         echo ERROR: Core dependency installation failed.
         pause
         exit /b 1
     )
-    copy /y "%ROOT%\requirements.txt" "%ROOT%\venv\.deps_core_installed" >nul
+    copy /y "%ROOT%\config\requirements.txt" "%ROOT%\venv\.deps_core_installed" >nul
     echo.
 ) else (
     echo   Core dependencies are up to date.
@@ -363,13 +363,13 @@ if "%INSTALL_DIARIZE%"=="1" (
     if "!NEED_DIAR_DEPS!"=="1" (
         echo Installing diarization dependencies...
         echo   (onnxruntime CPU-only installed before pyannote to prevent GPU variant^)
-        pip install -c "%ROOT%\constraints.txt" -r "%ROOT%\requirements-diarize.txt"
+        pip install -c "%ROOT%\config\constraints.txt" -r "%ROOT%\config\requirements-diarize.txt"
         if errorlevel 1 (
             echo ERROR: Diarization dependency installation failed.
             pause
             exit /b 1
         )
-        copy /y "%ROOT%\requirements-diarize.txt" "%ROOT%\venv\.deps_diarize_installed" >nul
+        copy /y "%ROOT%\config\requirements-diarize.txt" "%ROOT%\venv\.deps_diarize_installed" >nul
         echo.
     ) else (
         echo   Diarization dependencies are up to date.
@@ -397,7 +397,7 @@ if "%INSTALL_DIARIZE%"=="1" (
 
     rem --- HuggingFace token ---
     echo.
-    if not exist "%ROOT%\hf_token.txt" (
+    if not exist "%ROOT%\config\hf_token.txt" (
         echo Diarization requires a HuggingFace API token.
         echo Get one at: https://huggingface.co/settings/tokens
         echo You must also accept the model license at:
@@ -405,10 +405,10 @@ if "%INSTALL_DIARIZE%"=="1" (
         echo.
         set /p "HF_TOKEN=Paste your HF token (or press Enter to skip): "
         if defined HF_TOKEN (
-            echo !HF_TOKEN!> "%ROOT%\hf_token.txt"
-            echo   Token saved to hf_token.txt
+            echo !HF_TOKEN!> "%ROOT%\config\hf_token.txt"
+            echo   Token saved to config\hf_token.txt
         ) else (
-            echo   Skipped. Create hf_token.txt manually later for diarization.
+            echo   Skipped. Create config\hf_token.txt manually later for diarization.
         )
     ) else (
         echo HuggingFace token file already exists.

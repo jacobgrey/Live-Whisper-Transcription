@@ -61,7 +61,7 @@ _shutdown = threading.Event()
 _input_device = None          # None = system default; int device index
 job_lock = threading.Lock()
 
-DEVICE_CONFIG = PROJECT_ROOT / "input_device.txt"
+DEVICE_CONFIG = PROJECT_ROOT / "config" / "input_device.txt"
 
 
 def _load_device_pref():
@@ -305,7 +305,7 @@ def _load_hf_token() -> str | None:
         if v:
             return v.strip()
     try:
-        token_file = PROJECT_ROOT / "hf_token.txt"
+        token_file = PROJECT_ROOT / "config" / "hf_token.txt"
         if token_file.exists():
             return token_file.read_text(encoding="utf-8").strip()
     except Exception:

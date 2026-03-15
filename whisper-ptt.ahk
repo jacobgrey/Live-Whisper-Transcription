@@ -20,7 +20,7 @@ F7::
 F8::
 {
     global py, client
-    RunWait('cmd /c ""' py '" "' client '" START""', , "Hide")
+    RunWait('"' py '" "' client '" START', , "Hide")
 }
 
 F8 Up::
@@ -30,12 +30,11 @@ F8 Up::
     tmp := A_Temp "\whisper_ptt_out.txt"
     try FileDelete(tmp)
 
-    cmdLine := 'cmd /c ""' py '" "' client '" STOP > "' tmp '""'
-    RunWait(cmdLine, , "Hide")
+    RunWait('"' py '" "' client '" STOP --output "' tmp '"', , "Hide")
 
     if !FileExist(tmp) {
-        ; Uncomment to see what happened:
-        ; MsgBox "STOP produced no output file. Is the daemon running?"
+        ToolTip("Transcription failed: no output from daemon.`nIs the daemon running? (F7 to start)")
+        SetTimer(() => ToolTip(), -4000)
         return
     }
 
@@ -44,13 +43,25 @@ F8 Up::
     if (SubStr(out, 1, 3) = "OK ")
     {
         text := SubStr(out, 4)
+        if (Trim(text) = "")
+        {
+            ToolTip("No speech detected")
+            SetTimer(() => ToolTip(), -2000)
+            return
+        }
         A_Clipboard := text
         Sleep 120
         Send "^v"
     }
+    else if (out != "")
+    {
+        ToolTip("Transcription error: " SubStr(out, 1, 120))
+        SetTimer(() => ToolTip(), -4000)
+    }
     else
     {
-        ; MsgBox out
+        ToolTip("Transcription failed: empty response")
+        SetTimer(() => ToolTip(), -4000)
     }
 }
 

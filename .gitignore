@@ -5,14 +5,14 @@ venv/
 .idea/
 
 # Secrets
-hf_token.txt
+config/hf_token.txt
 
 # Generated/temp
 *.pyc
 __pycache__/
-constraints.txt
-python_installed.txt
-input_device.txt
+config/constraints.txt
+config/python_installed.txt
+config/input_device.txt
 
 # Downloaded tools (ffmpeg installed by setup.cmd)
 tools/

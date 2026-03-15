@@ -25,7 +25,7 @@ def load_hf_token() -> str | None:
         if v:
             return v.strip()
     try:
-        token_file = Path(__file__).resolve().parent.parent / "hf_token.txt"
+        token_file = Path(__file__).resolve().parent.parent / "config" / "hf_token.txt"
         if token_file.exists():
             return token_file.read_text(encoding="utf-8").strip()
     except Exception:

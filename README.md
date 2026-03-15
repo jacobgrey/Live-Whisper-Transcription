@@ -57,7 +57,7 @@ Diarization identifies different speakers in the audio and labels them (Speaker 
 
 1. Get a [HuggingFace token](https://huggingface.co/settings/tokens)
 2. Accept the [pyannote model license](https://huggingface.co/pyannote/speaker-diarization-3.1)
-3. Either paste the token during setup, or save it to `hf_token.txt` in the project root
+3. Either paste the token during setup, or save it to `config\hf_token.txt` in the project folder
 
 Diarization runs on GPU when available. On CPU it works but is significantly slower for long files.
 
@@ -91,7 +91,7 @@ The setup script handles all other dependencies automatically.
 
 **No text after releasing F8:** Verify the daemon is running (F7 to start it). Check that your microphone is set as the default recording device in Windows.
 
-**Diarization fails:** Ensure `hf_token.txt` exists and contains a valid token. You must accept the model license on HuggingFace.
+**Diarization fails:** Ensure `config\hf_token.txt` exists and contains a valid token. You must accept the model license on HuggingFace.
 
 **Slow first transcription:** Normal -- the model takes 15-30 seconds to load on first start. After that, transcriptions are fast.
 
