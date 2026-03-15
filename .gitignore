@@ -13,6 +13,9 @@ __pycache__/
 constraints.txt
 python_installed.txt
 
+# Downloaded tools (ffmpeg installed by setup.cmd)
+tools/
+
 # Archive folders
 Diarization (CPU) Version*/
 Non-Diarization Version*/

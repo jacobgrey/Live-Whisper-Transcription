@@ -1,12 +1,14 @@
 @echo off
 setlocal
 
-set "ROOT=D:\Programs\Whisper Speech to Text\ptt"
+for %%I in ("%~dp0..") do set "ROOT=%%~fI"
 set "PY=%ROOT%\venv\Scripts\python.exe"
 set "SCRIPT=%ROOT%\src\transcribe_drop.py"
-set "CUDA_BIN=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin"
 
-set "PATH=%CUDA_BIN%;%PATH%"
+rem Auto-detect CUDA toolkit (optional)
+set "CUDA_BIN="
+for /d %%D in ("C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*") do set "CUDA_BIN=%%~D\bin"
+if defined CUDA_BIN set "PATH=%CUDA_BIN%;%PATH%"
 
 "%PY%" "%SCRIPT%" %*
 echo.

@@ -1,9 +1,9 @@
 ﻿#Requires AutoHotkey v2.0
 #SingleInstance Force
 
-py := "D:\Programs\Whisper Speech to Text\ptt\venv\Scripts\python.exe"
-client := "D:\Programs\Whisper Speech to Text\ptt\src\whisper_client.py"
-daemonCmd := "D:\Programs\Whisper Speech to Text\ptt\scripts\start_daemon.cmd"
+py := A_ScriptDir "\venv\Scripts\python.exe"
+client := A_ScriptDir "\src\whisper_client.py"
+daemonCmd := A_ScriptDir "\scripts\start_daemon.cmd"
 
 ; Start daemon (manual hotkey)
 F7::
