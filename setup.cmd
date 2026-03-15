@@ -299,22 +299,20 @@ call "%ROOT%\venv\Scripts\activate.bat"
 python -m pip install --upgrade pip --quiet
 echo.
 
-rem --- Check if core deps need updating ---
-set "NEED_CORE_DEPS=1"
-if exist "%ROOT%\venv\.deps_core_installed" (
-    fc /b "%ROOT%\config\requirements.txt" "%ROOT%\venv\.deps_core_installed" >nul 2>&1
-    if not errorlevel 1 set "NEED_CORE_DEPS=0"
+rem --- Install / upgrade PyTorch ---
+set "NEED_TORCH=0"
+if "%NEED_VENV%"=="1" set "NEED_TORCH=1"
+if "%NEED_TORCH%"=="0" (
+    rem Check if installed torch version matches expected CUDA variant
+    if "%HAS_GPU%"=="1" (
+        python -c "import torch; exit(0 if 'cu126' in torch.__version__ else 1)" 2>nul
+        if errorlevel 1 set "NEED_TORCH=1"
+    ) else (
+        python -c "import torch; exit(0 if '+cu' not in torch.__version__ else 1)" 2>nul
+        if errorlevel 1 set "NEED_TORCH=1"
+    )
 )
-
-rem --- Check if diarization deps need updating ---
-set "NEED_DIAR_DEPS=1"
-if exist "%ROOT%\venv\.deps_diarize_installed" (
-    fc /b "%ROOT%\config\requirements-diarize.txt" "%ROOT%\venv\.deps_diarize_installed" >nul 2>&1
-    if not errorlevel 1 set "NEED_DIAR_DEPS=0"
-)
-
-rem --- Install PyTorch (only if venv is new) ---
-if "%NEED_VENV%"=="1" (
+if "%NEED_TORCH%"=="1" (
     if "%HAS_GPU%"=="1" (
         echo Installing CUDA-enabled PyTorch (this may take several minutes^)...
         pip install torch==2.7.1+cu126 torchvision==0.22.1+cu126 torchaudio==2.7.1+cu126 ^
@@ -340,7 +338,28 @@ if "%NEED_VENV%"=="1" (
         pip freeze | findstr /i "^torch" > "%ROOT%\config\constraints.txt"
     )
     echo.
+) else (
+    echo   PyTorch is up to date.
+    echo.
 )
+
+rem --- Check if core deps need updating ---
+set "NEED_CORE_DEPS=1"
+if exist "%ROOT%\venv\.deps_core_installed" (
+    fc /b "%ROOT%\config\requirements.txt" "%ROOT%\venv\.deps_core_installed" >nul 2>&1
+    if not errorlevel 1 set "NEED_CORE_DEPS=0"
+)
+rem If PyTorch was upgraded, force core deps to reinstall (constraints changed)
+if "%NEED_TORCH%"=="1" set "NEED_CORE_DEPS=1"
+
+rem --- Check if diarization deps need updating ---
+set "NEED_DIAR_DEPS=1"
+if exist "%ROOT%\venv\.deps_diarize_installed" (
+    fc /b "%ROOT%\config\requirements-diarize.txt" "%ROOT%\venv\.deps_diarize_installed" >nul 2>&1
+    if not errorlevel 1 set "NEED_DIAR_DEPS=0"
+)
+rem If PyTorch was upgraded, force diarization deps to reinstall too
+if "%NEED_TORCH%"=="1" set "NEED_DIAR_DEPS=1"
 
 rem --- Install core dependencies ---
 if "%NEED_CORE_DEPS%"=="1" (
