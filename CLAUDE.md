@@ -93,7 +93,7 @@ All Python commands should use the venv at `./venv/`. The `start_daemon.cmd` scr
 ## Critical Dependency Constraints
 
 - **setuptools==70.3.0** — Pinned; newer versions removed `pkg_resources` which pyannote needs.
-- **torch/torchvision/torchaudio** — GPU installs use matching CUDA 11.8 trio (`+cu118` wheels). CPU installs use standard PyPI wheels.
+- **torch/torchvision/torchaudio** — GPU installs use matching CUDA 12.6 trio (`+cu126` wheels). CPU installs use standard PyPI wheels.
 - **onnxruntime==1.19.2** — CPU-only; prevents GPU variant from causing conflicts.
 - **PyTorch 2.6+** — Requires `weights_only=False` workaround for checkpoint loading in diarize_worker.
 - **PL_DISABLE_FABRIC=1** — Set in start_daemon.cmd to avoid PyTorch Lightning import hangs.
