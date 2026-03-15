@@ -22,15 +22,15 @@ echo Upgrading pip...
 python -m pip install --upgrade pip
 
 echo.
-echo Installing CUDA 11.8 Torch stack...
-pip install torch==2.7.1+cu118 torchvision==0.22.1+cu118 torchaudio==2.7.1+cu118 ^
-  --index-url https://download.pytorch.org/whl/cu118
+echo Installing CUDA 12.6 Torch stack...
+pip install torch==2.7.1+cu126 torchvision==0.22.1+cu126 torchaudio==2.7.1+cu126 ^
+  --index-url https://download.pytorch.org/whl/cu126
 
 echo.
 echo Creating torch constraints file...
-echo torch==2.7.1+cu118 > config\constraints.txt
-echo torchvision==0.22.1+cu118 >> config\constraints.txt
-echo torchaudio==2.7.1+cu118 >> config\constraints.txt
+echo torch==2.7.1+cu126 > config\constraints.txt
+echo torchvision==0.22.1+cu126 >> config\constraints.txt
+echo torchaudio==2.7.1+cu126 >> config\constraints.txt
 
 echo.
 echo Installing core dependencies...

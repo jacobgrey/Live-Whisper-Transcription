@@ -24,3 +24,6 @@ Troubleshooting/
 
 # Transcription output
 transcripts/
+
+# Claude
+.claude/

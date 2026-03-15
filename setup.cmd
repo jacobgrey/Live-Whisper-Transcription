@@ -317,17 +317,17 @@ rem --- Install PyTorch (only if venv is new) ---
 if "%NEED_VENV%"=="1" (
     if "%HAS_GPU%"=="1" (
         echo Installing CUDA-enabled PyTorch (this may take several minutes^)...
-        pip install torch==2.7.1+cu118 torchvision==0.22.1+cu118 torchaudio==2.7.1+cu118 ^
-            --index-url https://download.pytorch.org/whl/cu118
+        pip install torch==2.7.1+cu126 torchvision==0.22.1+cu126 torchaudio==2.7.1+cu126 ^
+            --index-url https://download.pytorch.org/whl/cu126
         if errorlevel 1 (
             echo ERROR: PyTorch GPU installation failed.
             pause
             exit /b 1
         )
         (
-            echo torch==2.7.1+cu118
-            echo torchvision==0.22.1+cu118
-            echo torchaudio==2.7.1+cu118
+            echo torch==2.7.1+cu126
+            echo torchvision==0.22.1+cu126
+            echo torchaudio==2.7.1+cu126
         ) > "%ROOT%\config\constraints.txt"
     ) else (
         echo Installing CPU-only PyTorch (this may take several minutes^)...
