@@ -62,13 +62,14 @@ if not exist "%ROOT%\src\whisper_daemon.py" (
 )
 
 rem ============================================================
-rem  Phase 1: Detect what's missing
+rem  Phase 1: Detect system and ask options
 rem ============================================================
 
 set "NEED_PYTHON=0"
 set "NEED_FFMPEG=0"
 set "NEED_AHK=0"
 set "HAS_GPU=0"
+set "INSTALL_DIARIZE=0"
 
 rem --- Check Python 3.10 ---
 py -3.10 --version >nul 2>&1
@@ -103,6 +104,17 @@ rem --- Check if venv already exists ---
 set "NEED_VENV=1"
 if exist "%ROOT%\venv\Scripts\python.exe" set "NEED_VENV=0"
 
+rem --- Ask about diarization ---
+echo  Diarization adds speaker labels to transcriptions (Speaker 1,
+echo  Speaker 2, etc.^) when transcribing files. It requires extra
+echo  downloads (~2 GB^) and a free HuggingFace account. You can
+echo  always add it later by re-running setup.
+echo.
+set /p "DIAR_CHOICE=Install diarization (speaker labels)? [y/N] "
+if /i "!DIAR_CHOICE!"=="y" set "INSTALL_DIARIZE=1"
+if /i "!DIAR_CHOICE!"=="yes" set "INSTALL_DIARIZE=1"
+echo.
+
 rem ============================================================
 rem  Phase 2: Show the user what will happen
 rem ============================================================
@@ -129,7 +141,7 @@ if "%NEED_AHK%"=="1" (
 )
 
 if "%NEED_VENV%"=="1" (
-    echo  [INSTALL]  Python virtual environment + all dependencies
+    echo  [INSTALL]  Python virtual environment + dependencies
 ) else (
     echo  [OK]       Virtual environment (already exists^)
 )
@@ -138,6 +150,12 @@ if "%HAS_GPU%"=="1" (
     echo  [GPU]      !GPU_NAME! - will install CUDA-accelerated PyTorch
 ) else (
     echo  [CPU]      No NVIDIA GPU detected - will install CPU-only PyTorch
+)
+
+if "%INSTALL_DIARIZE%"=="1" (
+    echo  [INSTALL]  Diarization (pyannote speaker labeling^)
+) else (
+    echo  [SKIP]     Diarization (not selected^)
 )
 
 echo.
@@ -288,57 +306,56 @@ echo Installing core dependencies...
 pip install -c "%ROOT%\constraints.txt" setuptools==70.3.0
 pip install -c "%ROOT%\constraints.txt" huggingface_hub==0.22.2
 pip install -c "%ROOT%\constraints.txt" faster-whisper==1.2.1 sounddevice soundfile numpy
-
 echo.
-echo Installing onnxruntime (CPU-only, before pyannote to prevent GPU variant^)...
-pip install -c "%ROOT%\constraints.txt" "onnxruntime==1.19.2"
 
-echo.
-echo Installing pyannote diarization stack...
-pip install -c "%ROOT%\constraints.txt" pyannote.audio==3.3.2
-pip install -c "%ROOT%\constraints.txt" matplotlib
+rem --- Install diarization (optional) ---
+if "%INSTALL_DIARIZE%"=="1" (
+    echo Installing onnxruntime (CPU-only, before pyannote to prevent GPU variant^)...
+    pip install -c "%ROOT%\constraints.txt" "onnxruntime==1.19.2"
 
-rem --- CPU diarization warning ---
-if "%HAS_GPU%"=="0" (
     echo.
-    echo ============================================================
-    echo  NOTE: No NVIDIA GPU detected.
-    echo  Transcription will use CPU (slower but functional^).
-    echo  Diarization (speaker labeling^) is installed but will be
-    echo  VERY SLOW on CPU. Consider skipping it for long files.
-    echo ============================================================
-)
+    echo Installing pyannote diarization stack...
+    pip install -c "%ROOT%\constraints.txt" pyannote.audio==3.3.2
+    pip install -c "%ROOT%\constraints.txt" matplotlib
 
-rem --- Verify onnxruntime ---
-echo.
-echo Verifying onnxruntime...
-python -c "import onnxruntime; print('  onnxruntime', onnxruntime.__version__, '- providers:', onnxruntime.get_available_providers())"
-
-rem --- Set PYANNOTE_MODEL env var ---
-echo.
-echo Setting PYANNOTE_MODEL environment variable...
-setx PYANNOTE_MODEL pyannote/speaker-diarization-3.1 >nul 2>&1
-
-rem ============================================================
-rem  Phase 5: HuggingFace token
-rem ============================================================
-
-echo.
-if not exist "%ROOT%\hf_token.txt" (
-    echo Diarization requires a HuggingFace API token.
-    echo Get one at: https://huggingface.co/settings/tokens
-    echo You must also accept the model license at:
-    echo   https://huggingface.co/pyannote/speaker-diarization-3.1
-    echo.
-    set /p "HF_TOKEN=Paste your HF token (or press Enter to skip): "
-    if defined HF_TOKEN (
-        echo !HF_TOKEN!> "%ROOT%\hf_token.txt"
-        echo   Token saved to hf_token.txt
-    ) else (
-        echo   Skipped. Create hf_token.txt manually later for diarization.
+    if "%HAS_GPU%"=="0" (
+        echo.
+        echo ============================================================
+        echo  NOTE: No NVIDIA GPU detected.
+        echo  Transcription will use CPU (slower but functional^).
+        echo  Diarization (speaker labeling^) will be VERY SLOW on CPU.
+        echo  Consider skipping it for long files.
+        echo ============================================================
     )
-) else (
-    echo HuggingFace token file already exists.
+
+    rem --- Verify onnxruntime ---
+    echo.
+    echo Verifying onnxruntime...
+    python -c "import onnxruntime; print('  onnxruntime', onnxruntime.__version__, '- providers:', onnxruntime.get_available_providers())"
+
+    rem --- Set PYANNOTE_MODEL env var ---
+    echo.
+    echo Setting PYANNOTE_MODEL environment variable...
+    setx PYANNOTE_MODEL pyannote/speaker-diarization-3.1 >nul 2>&1
+
+    rem --- HuggingFace token ---
+    echo.
+    if not exist "%ROOT%\hf_token.txt" (
+        echo Diarization requires a HuggingFace API token.
+        echo Get one at: https://huggingface.co/settings/tokens
+        echo You must also accept the model license at:
+        echo   https://huggingface.co/pyannote/speaker-diarization-3.1
+        echo.
+        set /p "HF_TOKEN=Paste your HF token (or press Enter to skip): "
+        if defined HF_TOKEN (
+            echo !HF_TOKEN!> "%ROOT%\hf_token.txt"
+            echo   Token saved to hf_token.txt
+        ) else (
+            echo   Skipped. Create hf_token.txt manually later for diarization.
+        )
+    ) else (
+        echo HuggingFace token file already exists.
+    )
 )
 
 rem ============================================================
@@ -358,6 +375,11 @@ if "%HAS_GPU%"=="1" (
     echo  Mode: GPU (CUDA^)
 ) else (
     echo  Mode: CPU-only
+)
+if "%INSTALL_DIARIZE%"=="1" (
+    echo  Diarization: installed
+) else (
+    echo  Diarization: not installed (re-run setup to add^)
 )
 echo ============================================================
 pause

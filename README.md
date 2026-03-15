@@ -19,7 +19,7 @@ That's it. The setup script automatically:
 - Installs Python 3.10, ffmpeg, and AutoHotKey v2 if not already present
 - Detects your GPU and installs the right version of PyTorch (CUDA or CPU-only)
 - Creates a Python virtual environment with all dependencies
-- Prompts for a HuggingFace token (needed for speaker diarization)
+- Prompts for a HuggingFace token (needed for speaker diarization) if diarization is selected as an installed option.
 
 Before anything is installed, you'll see a summary of what will be set up and can cancel.
 
@@ -41,7 +41,7 @@ Run `scripts\start_daemon.cmd` (or press **F7** if the AHK script is running). T
 ### Batch transcription
 
 Drag an audio file or folder onto `scripts\Transcribe Drop.cmd`. You'll be prompted to:
-- Add speaker labels (diarization)
+- Add speaker labels (diarization) if desired
 - Include subfolders (for folder input)
 - Mirror folder structure in output
 
