@@ -49,8 +49,13 @@ F8 Up::
             SetTimer(() => ToolTip(), -2000)
             return
         }
+        A_Clipboard := ""
         A_Clipboard := text
-        Sleep 120
+        if !ClipWait(2) {
+            ToolTip("Clipboard failed — text: " SubStr(text, 1, 40))
+            SetTimer(() => ToolTip(), -4000)
+            return
+        }
         Send "^v"
     }
     else if (out != "")
