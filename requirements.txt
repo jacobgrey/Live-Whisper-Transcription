@@ -1,0 +1,6 @@
+setuptools==70.3.0
+huggingface_hub==0.22.2
+faster-whisper==1.2.1
+sounddevice
+soundfile
+numpy

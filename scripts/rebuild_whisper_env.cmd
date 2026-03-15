@@ -33,25 +33,19 @@ echo torchvision==0.22.1+cu118 >> constraints.txt
 echo torchaudio==2.7.1+cu118 >> constraints.txt
 
 echo.
-echo Installing pinned core dependencies...
-pip install -c constraints.txt setuptools==70.3.0
-pip install -c constraints.txt huggingface_hub==0.22.2
-
-echo.
-echo Installing faster-whisper stack...
-pip install -c constraints.txt faster-whisper==1.2.1 sounddevice soundfile numpy
+echo Installing core dependencies...
+pip install -c constraints.txt -r requirements.txt
+copy /y requirements.txt venv\.deps_core_installed >nul
 
 echo.
 echo --- FIX: Pin CPU-only onnxruntime BEFORE pyannote to prevent onnxruntime-gpu ---
 echo --- being pulled in as a transitive dep, which causes cuDNN symbol conflicts.  ---
 echo --- PyTorch already handles GPU for both Whisper and pyannote; onnxruntime     ---
 echo --- is only used for minor preprocessing steps and CPU is fine there.          ---
-pip install -c constraints.txt "onnxruntime==1.19.2"
-
 echo.
-echo Installing pyannote stack (stable pairing)...
-pip install -c constraints.txt pyannote.audio==3.3.2
-pip install -c constraints.txt matplotlib
+echo Installing diarization dependencies...
+pip install -c constraints.txt -r requirements-diarize.txt
+copy /y requirements-diarize.txt venv\.deps_diarize_installed >nul
 
 echo.
 echo Verifying onnxruntime was not upgraded to GPU variant...

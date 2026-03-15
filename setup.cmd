@@ -12,54 +12,79 @@ if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 cd /d "%ROOT%"
 
 rem ============================================================
-rem  Phase 0: Download project files if running standalone
+rem  Phase 0: Download / update project files from GitHub
 rem ============================================================
 
-if not exist "%ROOT%\src\whisper_daemon.py" (
+set "REPO_URL=https://github.com/jacobgrey/Live-Whisper-Transcription/archive/refs/heads/main.zip"
+set "ZIP_FILE=%TEMP%\whisper-repo.zip"
+set "EXTRACT_DIR=%TEMP%\whisper-repo-extract"
+set "FIRST_INSTALL=0"
+
+if not exist "%ROOT%\src\whisper_daemon.py" set "FIRST_INSTALL=1"
+
+if "%FIRST_INSTALL%"=="1" (
     echo Project files not found. Downloading from GitHub...
-    echo.
+) else (
+    echo Checking for updated project files from GitHub...
+)
+echo.
 
-    set "REPO_URL=https://github.com/jacobgrey/Live-Whisper-Transcription/archive/refs/heads/main.zip"
-    set "ZIP_FILE=%TEMP%\whisper-repo.zip"
-    set "EXTRACT_DIR=%TEMP%\whisper-repo-extract"
+powershell -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri '!REPO_URL!' -OutFile '!ZIP_FILE!' }" 2>nul
 
-    powershell -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri '!REPO_URL!' -OutFile '!ZIP_FILE!' }" 2>nul
-
-    if not exist "!ZIP_FILE!" (
+if not exist "!ZIP_FILE!" (
+    if "%FIRST_INSTALL%"=="1" (
         echo ERROR: Failed to download project files.
         echo Check your internet connection and try again.
         pause
         exit /b 1
+    ) else (
+        echo   Could not reach GitHub - skipping update. Existing files will be used.
+        echo.
+        goto :skip_update
     )
-
-    echo Extracting...
-    powershell -Command "& { $ProgressPreference = 'SilentlyContinue'; Expand-Archive -Path '!ZIP_FILE!' -DestinationPath '!EXTRACT_DIR!' -Force }" 2>nul
-
-    rem The zip extracts to a subfolder named Live-Whisper-Transcription-main
-    set "EXTRACTED="
-    for /d %%D in ("!EXTRACT_DIR!\*") do set "EXTRACTED=%%D"
-
-    if not defined EXTRACTED (
-        echo ERROR: Extraction failed.
-        del "!ZIP_FILE!" >nul 2>&1
-        pause
-        exit /b 1
-    )
-
-    rem Copy project files into current directory (where setup.cmd lives)
-    xcopy "!EXTRACTED!\*" "%ROOT%\" /e /y /q >nul
-    del "!ZIP_FILE!" >nul 2>&1
-    rmdir /s /q "!EXTRACT_DIR!" >nul 2>&1
-
-    if not exist "%ROOT%\src\whisper_daemon.py" (
-        echo ERROR: Project files missing after extraction.
-        pause
-        exit /b 1
-    )
-
-    echo   Project files downloaded successfully.
-    echo.
 )
+
+echo Extracting...
+powershell -Command "& { $ProgressPreference = 'SilentlyContinue'; Expand-Archive -Path '!ZIP_FILE!' -DestinationPath '!EXTRACT_DIR!' -Force }" 2>nul
+
+rem The zip extracts to a subfolder named Live-Whisper-Transcription-main
+set "EXTRACTED="
+for /d %%D in ("!EXTRACT_DIR!\*") do set "EXTRACTED=%%D"
+
+if not defined EXTRACTED (
+    echo ERROR: Extraction failed.
+    del "!ZIP_FILE!" >nul 2>&1
+    if "%FIRST_INSTALL%"=="1" (
+        pause
+        exit /b 1
+    ) else (
+        echo   Skipping update. Existing files will be used.
+        echo.
+        goto :skip_update
+    )
+)
+
+rem Copy project files into current directory (where setup.cmd lives)
+rem This overwrites existing project files with the latest versions
+rem User-specific files (hf_token.txt, venv/, constraints.txt) are not in the repo
+xcopy "!EXTRACTED!\*" "%ROOT%\" /e /y /q >nul
+del "!ZIP_FILE!" >nul 2>&1
+rmdir /s /q "!EXTRACT_DIR!" >nul 2>&1
+
+if not exist "%ROOT%\src\whisper_daemon.py" (
+    echo ERROR: Project files missing after extraction.
+    pause
+    exit /b 1
+)
+
+if "%FIRST_INSTALL%"=="1" (
+    echo   Project files downloaded successfully.
+) else (
+    echo   Project files updated to latest version.
+)
+echo.
+
+:skip_update
 
 rem ============================================================
 rem  Phase 1: Detect system and ask options
@@ -274,52 +299,84 @@ call "%ROOT%\venv\Scripts\activate.bat"
 python -m pip install --upgrade pip --quiet
 echo.
 
-rem --- Install PyTorch ---
-if "%HAS_GPU%"=="1" (
-    echo Installing CUDA-enabled PyTorch (this may take several minutes^)...
-    pip install torch==2.7.1+cu118 torchvision==0.22.1+cu118 torchaudio==2.7.1+cu118 ^
-        --index-url https://download.pytorch.org/whl/cu118
-    if errorlevel 1 (
-        echo ERROR: PyTorch GPU installation failed.
-        pause
-        exit /b 1
-    )
-    (
-        echo torch==2.7.1+cu118
-        echo torchvision==0.22.1+cu118
-        echo torchaudio==2.7.1+cu118
-    ) > "%ROOT%\constraints.txt"
-) else (
-    echo Installing CPU-only PyTorch (this may take several minutes^)...
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-    if errorlevel 1 (
-        echo ERROR: PyTorch CPU installation failed.
-        pause
-        exit /b 1
-    )
-    pip freeze | findstr /i "^torch" > "%ROOT%\constraints.txt"
+rem --- Check if core deps need updating ---
+set "NEED_CORE_DEPS=1"
+if exist "%ROOT%\venv\.deps_core_installed" (
+    fc /b "%ROOT%\requirements.txt" "%ROOT%\venv\.deps_core_installed" >nul 2>&1
+    if not errorlevel 1 set "NEED_CORE_DEPS=0"
 )
-echo.
+
+rem --- Check if diarization deps need updating ---
+set "NEED_DIAR_DEPS=1"
+if exist "%ROOT%\venv\.deps_diarize_installed" (
+    fc /b "%ROOT%\requirements-diarize.txt" "%ROOT%\venv\.deps_diarize_installed" >nul 2>&1
+    if not errorlevel 1 set "NEED_DIAR_DEPS=0"
+)
+
+rem --- Install PyTorch (only if venv is new) ---
+if "%NEED_VENV%"=="1" (
+    if "%HAS_GPU%"=="1" (
+        echo Installing CUDA-enabled PyTorch (this may take several minutes^)...
+        pip install torch==2.7.1+cu118 torchvision==0.22.1+cu118 torchaudio==2.7.1+cu118 ^
+            --index-url https://download.pytorch.org/whl/cu118
+        if errorlevel 1 (
+            echo ERROR: PyTorch GPU installation failed.
+            pause
+            exit /b 1
+        )
+        (
+            echo torch==2.7.1+cu118
+            echo torchvision==0.22.1+cu118
+            echo torchaudio==2.7.1+cu118
+        ) > "%ROOT%\constraints.txt"
+    ) else (
+        echo Installing CPU-only PyTorch (this may take several minutes^)...
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+        if errorlevel 1 (
+            echo ERROR: PyTorch CPU installation failed.
+            pause
+            exit /b 1
+        )
+        pip freeze | findstr /i "^torch" > "%ROOT%\constraints.txt"
+    )
+    echo.
+)
 
 rem --- Install core dependencies ---
-echo Installing core dependencies...
-pip install -c "%ROOT%\constraints.txt" setuptools==70.3.0
-pip install -c "%ROOT%\constraints.txt" huggingface_hub==0.22.2
-pip install -c "%ROOT%\constraints.txt" faster-whisper==1.2.1 sounddevice soundfile numpy
-echo.
+if "%NEED_CORE_DEPS%"=="1" (
+    echo Installing core dependencies...
+    pip install -c "%ROOT%\constraints.txt" -r "%ROOT%\requirements.txt"
+    if errorlevel 1 (
+        echo ERROR: Core dependency installation failed.
+        pause
+        exit /b 1
+    )
+    copy /y "%ROOT%\requirements.txt" "%ROOT%\venv\.deps_core_installed" >nul
+    echo.
+) else (
+    echo   Core dependencies are up to date.
+    echo.
+)
 
 rem --- Install diarization (optional) ---
 if "%INSTALL_DIARIZE%"=="1" (
-    echo Installing onnxruntime (CPU-only, before pyannote to prevent GPU variant^)...
-    pip install -c "%ROOT%\constraints.txt" "onnxruntime==1.19.2"
-
-    echo.
-    echo Installing pyannote diarization stack...
-    pip install -c "%ROOT%\constraints.txt" pyannote.audio==3.3.2
-    pip install -c "%ROOT%\constraints.txt" matplotlib
+    if "!NEED_DIAR_DEPS!"=="1" (
+        echo Installing diarization dependencies...
+        echo   (onnxruntime CPU-only installed before pyannote to prevent GPU variant^)
+        pip install -c "%ROOT%\constraints.txt" -r "%ROOT%\requirements-diarize.txt"
+        if errorlevel 1 (
+            echo ERROR: Diarization dependency installation failed.
+            pause
+            exit /b 1
+        )
+        copy /y "%ROOT%\requirements-diarize.txt" "%ROOT%\venv\.deps_diarize_installed" >nul
+        echo.
+    ) else (
+        echo   Diarization dependencies are up to date.
+        echo.
+    )
 
     if "%HAS_GPU%"=="0" (
-        echo.
         echo ============================================================
         echo  NOTE: No NVIDIA GPU detected.
         echo  Transcription will use CPU (slower but functional^).
