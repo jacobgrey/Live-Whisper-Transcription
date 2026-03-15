@@ -1,0 +1,22 @@
+# Python virtual environment
+venv/
+
+# IDE
+.idea/
+
+# Secrets
+hf_token.txt
+
+# Generated/temp
+*.pyc
+__pycache__/
+constraints.txt
+python_installed.txt
+
+# Archive folders
+Diarization (CPU) Version*/
+Non-Diarization Version*/
+Troubleshooting/
+
+# Transcription output
+transcripts/
