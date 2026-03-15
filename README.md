@@ -10,17 +10,20 @@ Local speech-to-text for Windows using [faster-whisper](https://github.com/SYSTR
 
 ## Quick Start
 
-1. Clone this repository
-2. Double-click **`setup.cmd`**
-3. The installer will detect your system and set up everything
+1. Download **[setup.cmd](https://raw.githubusercontent.com/jacobgrey/Live-Whisper-Transcription/main/setup.cmd)**
+2. Put it in the folder where you want the app installed
+3. Double-click it
 
 That's it. The setup script automatically:
+- Downloads the project files from GitHub
 - Installs Python 3.10, ffmpeg, and AutoHotKey v2 if not already present
 - Detects your GPU and installs the right version of PyTorch (CUDA or CPU-only)
 - Creates a Python virtual environment with all dependencies
 - Prompts for a HuggingFace token (needed for speaker diarization)
 
 Before anything is installed, you'll see a summary of what will be set up and can cancel.
+
+> Alternatively, you can clone this repo and run `setup.cmd` from inside it.
 
 ## Usage
 

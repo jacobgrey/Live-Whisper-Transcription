@@ -12,6 +12,56 @@ if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 cd /d "%ROOT%"
 
 rem ============================================================
+rem  Phase 0: Download project files if running standalone
+rem ============================================================
+
+if not exist "%ROOT%\src\whisper_daemon.py" (
+    echo Project files not found. Downloading from GitHub...
+    echo.
+
+    set "REPO_URL=https://github.com/jacobgrey/Live-Whisper-Transcription/archive/refs/heads/main.zip"
+    set "ZIP_FILE=%TEMP%\whisper-repo.zip"
+    set "EXTRACT_DIR=%TEMP%\whisper-repo-extract"
+
+    powershell -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri '!REPO_URL!' -OutFile '!ZIP_FILE!' }" 2>nul
+
+    if not exist "!ZIP_FILE!" (
+        echo ERROR: Failed to download project files.
+        echo Check your internet connection and try again.
+        pause
+        exit /b 1
+    )
+
+    echo Extracting...
+    powershell -Command "& { $ProgressPreference = 'SilentlyContinue'; Expand-Archive -Path '!ZIP_FILE!' -DestinationPath '!EXTRACT_DIR!' -Force }" 2>nul
+
+    rem The zip extracts to a subfolder named Live-Whisper-Transcription-main
+    set "EXTRACTED="
+    for /d %%D in ("!EXTRACT_DIR!\*") do set "EXTRACTED=%%D"
+
+    if not defined EXTRACTED (
+        echo ERROR: Extraction failed.
+        del "!ZIP_FILE!" >nul 2>&1
+        pause
+        exit /b 1
+    )
+
+    rem Copy project files into current directory (where setup.cmd lives)
+    xcopy "!EXTRACTED!\*" "%ROOT%\" /e /y /q >nul
+    del "!ZIP_FILE!" >nul 2>&1
+    rmdir /s /q "!EXTRACT_DIR!" >nul 2>&1
+
+    if not exist "%ROOT%\src\whisper_daemon.py" (
+        echo ERROR: Project files missing after extraction.
+        pause
+        exit /b 1
+    )
+
+    echo   Project files downloaded successfully.
+    echo.
+)
+
+rem ============================================================
 rem  Phase 1: Detect what's missing
 rem ============================================================
 
