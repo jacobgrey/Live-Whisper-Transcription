@@ -78,22 +78,94 @@ def yn(q, default=False):
             return False
 
 
-def get_channel_count(path: Path) -> int:
-    """Return channel count of first audio stream, 0 if undetectable or ffprobe missing."""
+def probe_audio_streams(path: Path) -> list[int]:
+    """Return channel count per audio stream, or [] on failure or no ffprobe."""
     try:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "error",
-                "-select_streams", "a:0",
+                "-select_streams", "a",
                 "-show_entries", "stream=channels",
-                "-of", "default=noprint_wrappers=1:nokey=1",
+                "-of", "csv=p=0",
                 str(path),
             ],
             capture_output=True, text=True, check=True, timeout=15,
         )
-        return int(result.stdout.strip() or "0")
+        return [int(ln.strip()) for ln in result.stdout.splitlines() if ln.strip()]
     except Exception:
-        return 0
+        return []
+
+
+def ask_track_speakers(track_count: int, track_kind: str) -> list:
+    """Prompt per track for expected speaker count.
+
+    Each entry in the returned list is:
+      - int >= 1 (1 = solo, no diarization; N>=2 = diarize with max N)
+      - None (auto-detect within this track)
+    Default when user hits Enter is 1 (solo) — matches the common OBS case of
+    'mic = just me, Discord = multiple'.
+    """
+    label = "Stream" if track_kind == "stream" else "Channel"
+    print(
+        f"\nFor each {label.lower()}, enter expected speaker count:\n"
+        f"  Enter      = 1 (solo, no diarization)\n"
+        f"  N (>=2)    = diarize, up to N speakers\n"
+        f"  'auto'     = diarize, let pyannote pick\n"
+    )
+    result: list = []
+    for i in range(track_count):
+        while True:
+            raw = input(f"{label} {i + 1} speakers [1]: ").strip().lower()
+            if not raw:
+                result.append(1)
+                break
+            if raw in ("auto", "a"):
+                result.append(None)
+                break
+            try:
+                n = int(raw)
+                if n < 1:
+                    raise ValueError
+                result.append(n)
+                break
+            except ValueError:
+                print("  Enter a positive integer, 'auto', or blank.")
+    return result
+
+
+def ask_folder_track_speakers() -> list:
+    """Ask up to 2 default track-speaker counts for folder jobs.
+
+    Folder files can have heterogeneous layouts; we accept defaults for the
+    first two tracks (covers the common OBS mic + Discord case). Extra tracks
+    default to 1 (solo). User can still choose auto per slot.
+    """
+    print(
+        "\nFolder multi-track defaults — applied to each file's tracks in order.\n"
+        "Leave blank to default to 1 (solo).\n"
+    )
+    result: list = []
+    for i in range(2):
+        while True:
+            raw = input(
+                f"Track {i + 1} default speakers [1] "
+                f"(integer, 'auto', or blank): "
+            ).strip().lower()
+            if not raw:
+                result.append(1)
+                break
+            if raw in ("auto", "a"):
+                result.append(None)
+                break
+            try:
+                n = int(raw)
+                if n < 1:
+                    raise ValueError
+                result.append(n)
+                break
+            except ValueError:
+                print("  Enter a positive integer, 'auto', or blank.")
+    return result
 
 
 def ask_speaker_hint() -> dict:
@@ -146,21 +218,40 @@ def main(argv):
         if p.is_file():
             diar = yn("Add speaker labels (diarization)?", False)
             hint: dict = {}
-            per_channel = False
+            multi_track = False
+            track_speakers: list = []
+            track_kind = ""
             if diar:
-                ch = get_channel_count(p)
-                if ch >= 2:
-                    per_channel = yn(
-                        f"File has {ch} audio channel(s). Treat each channel as a separate speaker?",
+                streams = probe_audio_streams(p)
+                if len(streams) >= 2:
+                    multi_track = yn(
+                        f"File has {len(streams)} audio streams "
+                        f"(likely mic + system audio). "
+                        f"Treat each stream as a separate speaker?",
+                        True,
+                    )
+                    if multi_track:
+                        track_kind = "stream"
+                        track_speakers = ask_track_speakers(len(streams), "stream")
+                elif len(streams) == 1 and streams[0] >= 2:
+                    multi_track = yn(
+                        f"File has {streams[0]} audio channels in one stream. "
+                        f"Treat each channel as a separate speaker? "
+                        f"(only say yes if you know channels are cleanly split)",
                         False,
                     )
-                if not per_channel:
+                    if multi_track:
+                        track_kind = "channel"
+                        track_speakers = ask_track_speakers(streams[0], "channel")
+                if not multi_track:
                     hint = ask_speaker_hint()
             if use_daemon:
                 op = "TRANSCRIBE_FILE_DIARIZED" if diar else "TRANSCRIBE_FILE"
                 payload = {"path": str(p), **hint}
-                if per_channel:
-                    payload["per_channel"] = True
+                if multi_track:
+                    payload["multi_track"] = True
+                    if track_speakers:
+                        payload["track_speakers"] = track_speakers
                 print(f"\nStarting job — progress will appear below.\n")
                 result = daemon_send_streaming(op + " " + json.dumps(payload))
                 print(f"\n{result}")
@@ -175,13 +266,17 @@ def main(argv):
 
             diar = yn("Add speaker labels (diarization)?", False)
             hint = {}
-            per_channel = False
+            multi_track = False
+            track_speakers = []
             if diar:
-                per_channel = yn(
-                    "Use per-channel mode for stereo files? (mono files fall back to normal diarization)",
+                multi_track = yn(
+                    "Separate speakers by audio stream/channel where possible? "
+                    "(mono files fall back to diarization)",
                     False,
                 )
-                if not per_channel:
+                if multi_track:
+                    track_speakers = ask_folder_track_speakers()
+                else:
                     hint = ask_speaker_hint()
 
             if use_daemon:
@@ -192,8 +287,10 @@ def main(argv):
                     "mirror_structure": mir,
                     **hint,
                 }
-                if per_channel:
-                    payload_dict["per_channel"] = True
+                if multi_track:
+                    payload_dict["multi_track"] = True
+                    if track_speakers:
+                        payload_dict["track_speakers"] = track_speakers
                 payload = json.dumps(payload_dict)
                 print(f"\nStarting folder job — progress will appear below.\n")
                 result = daemon_send_streaming(op + " " + payload)

@@ -287,36 +287,72 @@ def _sanitize_out_name(p: Path) -> str:
     return re.sub(r"[^\w\-\. ]+", "_", p.stem) + ".txt"
 
 
-def get_channel_count(path: Path) -> int:
-    """Return channel count of the first audio stream, or 0 if undetectable."""
+def probe_audio_streams(path: Path) -> list[int]:
+    """Return channel count of each audio stream in order, or [] on failure.
+
+    A file with two stereo audio streams (common for screen-recording tools that
+    capture mic + desktop separately) returns [2, 2].
+    """
     try:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "error",
-                "-select_streams", "a:0",
+                "-select_streams", "a",
                 "-show_entries", "stream=channels",
-                "-of", "default=noprint_wrappers=1:nokey=1",
+                "-of", "csv=p=0",
                 str(path),
             ],
             capture_output=True, text=True, check=True, timeout=15,
         )
-        return int(result.stdout.strip() or "0")
+        return [int(ln.strip()) for ln in result.stdout.splitlines() if ln.strip()]
     except Exception:
-        return 0
+        return []
 
 
-def split_channel(src: Path, tmp: Path, channel_idx: int) -> list[Path]:
-    """Chunk a single channel of the source into 15-min mono 16k WAVs.
+def _speaker_tracks_for(path: Path) -> list[dict]:
+    """Decide how to split a file for per-speaker transcription.
 
-    `pan=mono|c0=c<N>` extracts just channel N; works even if source has 2+ channels.
+    Returns a list of track descriptors, each:
+      {"label": "Speaker N", "kind": "stream"|"channel", "index": int}
+
+    Strategy:
+    - If the file has >=2 audio streams, each stream is one speaker (downmixed
+      to mono). This is the case for OBS-style recordings (mic + desktop audio).
+    - Else if the single audio stream has >=2 channels, each channel is one
+      speaker. This is the case for clean L/R stereo recordings.
+    - Otherwise returns [] (no meaningful separation possible).
     """
-    out_pattern = tmp / f"ch{channel_idx}_%03d.wav"
+    streams = probe_audio_streams(path)
+    if len(streams) >= 2:
+        return [
+            {"label": f"Speaker {i + 1}", "kind": "stream", "index": i}
+            for i in range(len(streams))
+        ]
+    if len(streams) == 1 and streams[0] >= 2:
+        return [
+            {"label": f"Speaker {i + 1}", "kind": "channel", "index": i}
+            for i in range(streams[0])
+        ]
+    return []
+
+
+def split_track(src: Path, tmp: Path, track: dict, track_idx: int) -> list[Path]:
+    """Extract one track (stream or channel) as mono 16k 15-min chunks."""
+    out_pattern = tmp / f"t{track_idx}_%03d.wav"
+    if track["kind"] == "stream":
+        # Downmix the whole stream to mono. Handles the L==R duplicated-mono
+        # case (common for OBS mic streams) correctly.
+        extra = ["-map", f"0:a:{track['index']}", "-ac", "1"]
+    elif track["kind"] == "channel":
+        extra = ["-vn", "-af", f"pan=mono|c0=c{track['index']}"]
+    else:
+        raise ValueError(f"unknown track kind: {track['kind']!r}")
+
     subprocess.run(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-i", str(src),
-            "-vn",
-            "-af", f"pan=mono|c0=c{channel_idx}",
+            *extra,
             "-ar", "16000", "-c:a", "pcm_s16le",
             "-f", "segment", "-segment_time", str(CHUNK_SECONDS),
             "-reset_timestamps", "1",
@@ -324,7 +360,22 @@ def split_channel(src: Path, tmp: Path, channel_idx: int) -> list[Path]:
         ],
         check=True,
     )
-    return sorted(tmp.glob(f"ch{channel_idx}_*.wav"))
+    return sorted(tmp.glob(f"t{track_idx}_*.wav"))
+
+
+def _avoid_overwrite(out: Path) -> Path:
+    """Return `out` if it doesn't exist, otherwise the same name with a
+    ` (YYYY-MM-DD HH-MM-SS)` suffix before the extension. Prevents clobbering
+    previous transcripts when re-running."""
+    if not out.exists():
+        return out
+    stamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    candidate = out.with_name(f"{out.stem} ({stamp}){out.suffix}")
+    n = 2
+    while candidate.exists():
+        candidate = out.with_name(f"{out.stem} ({stamp}_{n}){out.suffix}")
+        n += 1
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +575,19 @@ def _diarize_wav(
 # Cross-chunk speaker stitching
 # ---------------------------------------------------------------------------
 
+class GlobalLabeler:
+    """Dispenses unique `Speaker N` labels. Shared across trackers so a single
+    file with multiple diarized tracks keeps consecutive, non-colliding IDs."""
+
+    def __init__(self, start: int = 1):
+        self._next = start
+
+    def next(self) -> str:
+        name = f"Speaker {self._next}"
+        self._next += 1
+        return name
+
+
 class GlobalSpeakerTracker:
     """Match chunk-local speaker labels to stable global speakers across chunks.
 
@@ -533,12 +597,16 @@ class GlobalSpeakerTracker:
     speakers by cosine similarity.
     """
 
-    def __init__(self, threshold: float = SPEAKER_MATCH_THRESHOLD):
+    def __init__(
+        self,
+        threshold: float = SPEAKER_MATCH_THRESHOLD,
+        labeler: GlobalLabeler | None = None,
+    ):
         self.threshold = threshold
-        self._centroids: list[np.ndarray] = []     # index = global id
-        self._counts: list[int] = []               # count of local speakers folded in
-        self._names: list[str] = []                # "Speaker 1", "Speaker 2", ...
-        self._fallback_next_id = 0                 # used only when no embeddings are available
+        self._labeler = labeler or GlobalLabeler()
+        self._centroids: list[np.ndarray] = []     # index = local-to-global id
+        self._counts: list[int] = []
+        self._names: list[str] = []
 
     def _match(self, vec: np.ndarray) -> int | None:
         if not self._centroids:
@@ -558,7 +626,7 @@ class GlobalSpeakerTracker:
         return best_idx if best_sim >= self.threshold else None
 
     def _new_speaker(self, vec: np.ndarray | None) -> str:
-        name = f"Speaker {len(self._names) + 1}"
+        name = self._labeler.next()
         self._names.append(name)
         self._counts.append(1 if vec is not None else 0)
         self._centroids.append(vec.copy() if vec is not None else np.zeros(0, dtype=np.float32))
@@ -568,13 +636,8 @@ class GlobalSpeakerTracker:
         """Return the stable global name for a local chunk speaker."""
         if embedding is None or embedding.size == 0:
             # No embedding — fall back to treating each distinct local label as new.
-            # This loses cross-chunk identity but preserves correctness within a chunk.
-            name = f"Speaker {self._fallback_next_id + 1}"
-            self._fallback_next_id += 1
-            self._names.append(name)
-            self._counts.append(0)
-            self._centroids.append(np.zeros(0, dtype=np.float32))
-            return name
+            # Loses cross-chunk identity but preserves within-chunk correctness.
+            return self._new_speaker(None)
 
         match = self._match(embedding)
         if match is None:
@@ -772,76 +835,152 @@ def transcribe_file_diarized(
 # Per-channel transcription (for stereo recordings where each channel is one speaker)
 # ---------------------------------------------------------------------------
 
-def transcribe_file_per_channel(p: Path, out: Path, progress=_noop):
-    log(f"Per-channel job started: {p.name}")
-    channels = get_channel_count(p)
-    if channels < 2:
-        raise RuntimeError(
-            f"per-channel mode requires >=2 audio channels; {p.name} has {channels}"
-        )
-    if channels > 2:
-        log(f"WARNING: {p.name} has {channels} channels; only using first 2")
+def transcribe_file_multi_track(
+    p: Path,
+    out: Path,
+    progress=_noop,
+    track_speakers: list | None = None,
+):
+    """Transcribe a file with independent per-speaker audio tracks.
 
+    Layouts handled:
+    - Multiple audio streams (e.g. OBS mic + Discord capture): each stream
+      downmixed to mono. Avoids the 'L==R duplicated mono' trap.
+    - Single stream with multiple channels: each channel is one track.
+
+    `track_speakers` is a list aligned with tracks; each element may be:
+      - an int (1 = single speaker, no diarization; N>=2 = diarize with
+        max_speakers=N within that track)
+      - None (auto-diarize within that track; pyannote picks the count)
+    Missing / extra entries default to 1 (single speaker).
+    """
+    tracks = _speaker_tracks_for(p)
+    if not tracks:
+        raise RuntimeError(
+            f"no suitable tracks for speaker separation in {p.name} "
+            f"(need >=2 audio streams, or >=2 channels in one stream)"
+        )
+
+    # Align track_speakers with the detected tracks.
+    hints: list[int | None] = list(track_speakers or [])
+    while len(hints) < len(tracks):
+        hints.append(1)
+    hints = hints[:len(tracks)]
+
+    kind_summary = (
+        f"{len(tracks)} streams"
+        if tracks[0]["kind"] == "stream"
+        else f"{len(tracks)} channels of stream 0"
+    )
+    hint_summary = ", ".join(
+        "auto" if h is None else ("solo" if h == 1 else f"<={h}")
+        for h in hints
+    )
+    log(f"Multi-track job started: {p.name}  ({kind_summary}; speakers: {hint_summary})")
     duration = get_duration(p)
-    tmpdir = Path(tempfile.mkdtemp(prefix="whisper_perch_"))
+    tmpdir = Path(tempfile.mkdtemp(prefix="whisper_mt_"))
 
     try:
         dur_str = f"  ({fmt_eta(duration)} source)" if duration else ""
-        progress(f"Splitting per channel{dur_str} ...")
+        progress(f"Splitting {kind_summary}{dur_str} ...")
 
-        ch0_chunks = split_channel(p, tmpdir, 0)
-        ch1_chunks = split_channel(p, tmpdir, 1)
-        total = max(len(ch0_chunks), len(ch1_chunks))
+        track_chunks: list[list[Path]] = []
+        for t_idx, track in enumerate(tracks):
+            track_chunks.append(split_track(p, tmpdir, track, t_idx))
+
+        total = max(len(c) for c in track_chunks)
         if total == 0:
             raise RuntimeError("ffmpeg produced no chunks")
         w = len(str(total))
         t0 = time.time()
 
+        # Shared labeler: every Speaker N across every track comes from here,
+        # so numbering stays unique and (roughly) in order of first speech.
+        labeler = GlobalLabeler()
+
+        # Per-track state:
+        #   "solo_label": lazily-allocated name for a 1-speaker track
+        #   "tracker":    GlobalSpeakerTracker for diarized tracks
+        track_state: list[dict] = []
+        for i, hint in enumerate(hints):
+            if hint == 1:
+                track_state.append({"kind": "solo", "label": None})
+            else:
+                # None (auto) or int>=2 → diarize within this track.
+                sub_hint: dict | None = {"max_speakers": hint} if isinstance(hint, int) and hint >= 2 else None
+                track_state.append({
+                    "kind": "diar",
+                    "tracker": GlobalSpeakerTracker(labeler=labeler),
+                    "sub_hint": sub_hint,
+                })
+
         merged_lines: list[str] = []
         carry: dict = {"speaker": None, "start": 0.0, "parts": []}
         chunk_offset = 0.0
 
-        for idx in range(1, total + 1):
+        for idx in range(total):
             elapsed_pre = time.time() - t0
-            if idx > 1:
-                eta_str = f"  |  ETA ~{fmt_eta((elapsed_pre / (idx - 1)) * (total - idx + 1))}"
-            else:
-                eta_str = ""
+            eta_str = (
+                f"  |  ETA ~{fmt_eta((elapsed_pre / idx) * (total - idx))}"
+                if idx > 0 else ""
+            )
             progress(
-                f"Chunk {idx:{w}}/{total}  —  transcribing L+R ..."
+                f"Chunk {idx + 1:{w}}/{total}  —  processing {len(tracks)} track(s) ..."
                 f"  |  elapsed {fmt_elapsed(elapsed_pre)}{eta_str}"
             )
 
-            ch0 = ch0_chunks[idx - 1] if idx - 1 < len(ch0_chunks) else None
-            ch1 = ch1_chunks[idx - 1] if idx - 1 < len(ch1_chunks) else None
-
-            # Transcribe each channel once; tag each word with its channel speaker.
             all_words: list[tuple[float, float, str, str | None]] = []
-            if ch0 is not None:
-                for ws, we, wt in _whisper_words(ch0):
-                    all_words.append((ws, we, wt, "Speaker 1"))
-            if ch1 is not None:
-                for ws, we, wt in _whisper_words(ch1):
-                    all_words.append((ws, we, wt, "Speaker 2"))
+            chunk_durations: list[float] = []
 
-            # Sort by start time so interleaved speech comes out in order.
+            for t_idx, track in enumerate(tracks):
+                if idx >= len(track_chunks[t_idx]):
+                    continue
+                chunk_path = track_chunks[t_idx][idx]
+                chunk_durations.append(get_duration(chunk_path))
+
+                state = track_state[t_idx]
+                words = _whisper_words(chunk_path)
+                if not words:
+                    continue
+
+                if state["kind"] == "solo":
+                    if state["label"] is None:
+                        state["label"] = labeler.next()
+                    label = state["label"]
+                    for ws, we, wt in words:
+                        all_words.append((ws, we, wt, label))
+                else:
+                    # Diarize this track's chunk and assign its words.
+                    diar_segs, emb_by_label = _diarize_wav(
+                        chunk_path, speaker_hint=state["sub_hint"]
+                    )
+                    active = [s for s in diar_segs if s[1] - s[0] >= 0.15]
+
+                    tracker: GlobalSpeakerTracker = state["tracker"]
+                    local_to_global: dict[str, str] = {}
+                    for _s, _e, spk in active:
+                        if spk not in local_to_global:
+                            local_to_global[spk] = tracker.assign(spk, emb_by_label.get(spk))
+
+                    global_segs = [
+                        (s, e, local_to_global[spk]) for (s, e, spk) in active
+                    ]
+                    global_segs.sort(key=lambda x: x[0])
+
+                    annotated = _assign_words_to_diar(words, global_segs)
+                    for ws, we, wt, spk in annotated:
+                        all_words.append((ws, we, wt, spk))
+
             all_words.sort(key=lambda x: x[0])
-
             turns = _words_to_turns(all_words, chunk_offset)
             _emit_turns_to_lines(turns, merged_lines, carry)
 
-            # Use the longest of the two channel chunks to advance the offset.
-            adv = 0.0
-            if ch0 is not None:
-                adv = max(adv, get_duration(ch0))
-            if ch1 is not None:
-                adv = max(adv, get_duration(ch1))
-            chunk_offset += adv
+            chunk_offset += max(chunk_durations) if chunk_durations else 0.0
 
             elapsed = time.time() - t0
-            eta = (elapsed / idx) * (total - idx)
+            eta = (elapsed / (idx + 1)) * (total - idx - 1)
             progress(
-                f"Chunk {idx:{w}}/{total}  done"
+                f"Chunk {idx + 1:{w}}/{total}  done"
                 f"  |  elapsed {fmt_elapsed(elapsed)}"
                 f"  |  ETA {fmt_eta(eta)}"
             )
@@ -850,7 +989,7 @@ def transcribe_file_per_channel(p: Path, out: Path, progress=_noop):
 
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(merged_lines).strip() + "\n", encoding="utf-8")
-        log(f"Per-channel job finished in {fmt_elapsed(time.time() - t0)} -> {out.name}")
+        log(f"Multi-track job finished in {fmt_elapsed(time.time() - t0)} -> {out.name}")
 
     finally:
         _cleanup_tmp(tmpdir)
@@ -903,6 +1042,28 @@ def _extract_speaker_hint(d: dict) -> dict | None:
     return hint or None
 
 
+def _parse_track_speakers(raw) -> list | None:
+    """Parse a per-track speaker-count list from the payload.
+
+    Accepts a list whose elements are int or None (JSON null). Non-positive
+    ints become None (auto). Non-list input returns None.
+    """
+    if not isinstance(raw, list):
+        return None
+    out: list = []
+    for v in raw:
+        if v is None:
+            out.append(None)
+        else:
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                out.append(None)
+                continue
+            out.append(n if n >= 1 else None)
+    return out or None
+
+
 def make_progress_sender(c):
     """Return a callable that streams a PROGRESS line to the connected client."""
     def send(msg: str):
@@ -938,13 +1099,16 @@ def client(c):
         elif op in ("TRANSCRIBE_FILE", "TRANSCRIBE_FILE_DIARIZED"):
             d = json.loads(payload)
             p = Path(d["path"])
-            out = p.with_name(_sanitize_out_name(p))
+            out = _avoid_overwrite(p.with_name(_sanitize_out_name(p)))
             hint = _extract_speaker_hint(d)
-            per_channel = bool(d.get("per_channel"))
+            multi_track = bool(d.get("multi_track") or d.get("per_channel"))
+            track_speakers = _parse_track_speakers(d.get("track_speakers"))
 
             with job_lock:
-                if per_channel:
-                    transcribe_file_per_channel(p, out, progress=progress)
+                if multi_track:
+                    transcribe_file_multi_track(
+                        p, out, progress=progress, track_speakers=track_speakers
+                    )
                 elif op == "TRANSCRIBE_FILE_DIARIZED" or d.get("diarize") is True:
                     transcribe_file_diarized(p, out, progress=progress, speaker_hint=hint)
                 else:
@@ -959,7 +1123,8 @@ def client(c):
             mir = d.get("mirror_structure", False)
             diarize = (op == "TRANSCRIBE_FOLDER_DIARIZED") or (d.get("diarize") is True)
             hint = _extract_speaker_hint(d) if diarize else None
-            per_channel_pref = bool(d.get("per_channel"))
+            multi_track_pref = bool(d.get("multi_track") or d.get("per_channel"))
+            track_speakers = _parse_track_speakers(d.get("track_speakers"))
 
             files = [p for p in (root.rglob("*") if inc else root.glob("*")) if p.is_file()]
             log(f"Folder job: {len(files)} file(s)")
@@ -973,20 +1138,24 @@ def client(c):
                         if mir
                         else (root / FOLDER_OUT_SUBDIR / f.name)
                     ).with_suffix(".txt")
+                    out = _avoid_overwrite(out)
 
-                    # Per-channel is a preference: apply when the file actually
-                    # has >=2 channels, otherwise fall back to regular diarization.
-                    use_per_channel = False
-                    if per_channel_pref and diarize:
-                        if get_channel_count(f) >= 2:
-                            use_per_channel = True
+                    # Multi-track is a preference: apply when the file actually
+                    # has a usable layout, otherwise fall back to diarization.
+                    use_multi_track = False
+                    if multi_track_pref and diarize:
+                        if _speaker_tracks_for(f):
+                            use_multi_track = True
                         else:
                             progress(
-                                f"  {f.name} is mono — using normal diarization"
+                                f"  {f.name} has no multi-track layout — "
+                                f"using normal diarization"
                             )
 
-                    if use_per_channel:
-                        transcribe_file_per_channel(f, out, progress=progress)
+                    if use_multi_track:
+                        transcribe_file_multi_track(
+                            f, out, progress=progress, track_speakers=track_speakers
+                        )
                     elif diarize:
                         transcribe_file_diarized(f, out, progress=progress, speaker_hint=hint)
                     else:
