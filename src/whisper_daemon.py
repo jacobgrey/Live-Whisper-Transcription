@@ -52,6 +52,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PYANNOTE_MODEL = os.environ.get("PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1")
 DIARIZE_WORKER = Path(__file__).with_name("diarize_worker.py")
 
+# Cosine-similarity threshold for matching a chunk-local speaker to a previously
+# seen global speaker. Pyannote WeSpeaker embeddings typically score ~0.6-0.8 for
+# same speaker and ~0.1-0.4 for different speakers; 0.55 balances both. Overridable.
+SPEAKER_MATCH_THRESHOLD = float(os.environ.get("SPEAKER_MATCH_THRESHOLD", "0.55"))
+
 _language = "en"
 _model = None
 _recording = False
@@ -313,10 +318,29 @@ def _load_hf_token() -> str | None:
     return None
 
 
-def _diarize_wav(wav_path: Path, use_cpu: bool = False) -> list[tuple[float, float, str]]:
+def _diarize_wav(
+    wav_path: Path,
+    use_cpu: bool = False,
+    speaker_hint: dict | None = None,
+) -> tuple[list[tuple[float, float, str]], dict[str, np.ndarray]]:
+    """Run diarization subprocess. Returns (segments, embeddings_by_local_label).
+
+    `speaker_hint` may contain any of: num_speakers, min_speakers, max_speakers.
+    `embeddings_by_local_label` maps each chunk-local SPEAKER_xx to its 1-D numpy
+    embedding vector, or is empty if the pipeline didn't return embeddings.
+    """
     cmd = [sys.executable, str(DIARIZE_WORKER), str(wav_path)]
     if use_cpu:
         cmd.append("--cpu")
+
+    if speaker_hint:
+        if speaker_hint.get("num_speakers") is not None:
+            cmd += ["--num-speakers", str(int(speaker_hint["num_speakers"]))]
+        else:
+            if speaker_hint.get("min_speakers") is not None:
+                cmd += ["--min-speakers", str(int(speaker_hint["min_speakers"]))]
+            if speaker_hint.get("max_speakers") is not None:
+                cmd += ["--max-speakers", str(int(speaker_hint["max_speakers"]))]
 
     env = {**os.environ}
     token = _load_hf_token()
@@ -344,7 +368,99 @@ def _diarize_wav(wav_path: Path, use_cpu: bool = False) -> list[tuple[float, flo
     if isinstance(data, dict) and "error" in data:
         raise RuntimeError(f"diarize_worker reported: {data['error']}")
 
-    return [(s["start"], s["end"], s["speaker"]) for s in data]
+    # New format: {"segments": [...], "embeddings": {...}}.
+    # Old format (pre-v2): [{"start": ..., "end": ..., "speaker": ...}, ...].
+    if isinstance(data, list):
+        segments = data
+        embeddings_raw: dict = {}
+    else:
+        segments = data.get("segments", [])
+        embeddings_raw = data.get("embeddings", {}) or {}
+
+    seg_tuples = [(s["start"], s["end"], s["speaker"]) for s in segments]
+    emb_by_label = {
+        str(k): np.asarray(v, dtype=np.float32)
+        for k, v in embeddings_raw.items()
+        if v is not None
+    }
+    return seg_tuples, emb_by_label
+
+
+# ---------------------------------------------------------------------------
+# Cross-chunk speaker stitching
+# ---------------------------------------------------------------------------
+
+class GlobalSpeakerTracker:
+    """Match chunk-local speaker labels to stable global speakers across chunks.
+
+    Pyannote's SPEAKER_00/SPEAKER_01 labels are local to each pipeline call, so
+    naive label reuse across chunks causes phantom speakers. This class keeps a
+    running-mean embedding (centroid) per global speaker and matches new local
+    speakers by cosine similarity.
+    """
+
+    def __init__(self, threshold: float = SPEAKER_MATCH_THRESHOLD):
+        self.threshold = threshold
+        self._centroids: list[np.ndarray] = []     # index = global id
+        self._counts: list[int] = []               # count of local speakers folded in
+        self._names: list[str] = []                # "Speaker 1", "Speaker 2", ...
+        self._fallback_next_id = 0                 # used only when no embeddings are available
+
+    def _match(self, vec: np.ndarray) -> int | None:
+        if not self._centroids:
+            return None
+        norm = np.linalg.norm(vec)
+        if norm == 0:
+            return None
+        best_idx, best_sim = -1, -1.0
+        for i, c in enumerate(self._centroids):
+            cn = np.linalg.norm(c)
+            if cn == 0:
+                continue
+            sim = float(np.dot(vec, c) / (norm * cn))
+            if sim > best_sim:
+                best_sim = sim
+                best_idx = i
+        return best_idx if best_sim >= self.threshold else None
+
+    def _new_speaker(self, vec: np.ndarray | None) -> str:
+        name = f"Speaker {len(self._names) + 1}"
+        self._names.append(name)
+        self._counts.append(1 if vec is not None else 0)
+        self._centroids.append(vec.copy() if vec is not None else np.zeros(0, dtype=np.float32))
+        return name
+
+    def assign(self, local_label: str, embedding: np.ndarray | None) -> str:
+        """Return the stable global name for a local chunk speaker."""
+        if embedding is None or embedding.size == 0:
+            # No embedding — fall back to treating each distinct local label as new.
+            # This loses cross-chunk identity but preserves correctness within a chunk.
+            name = f"Speaker {self._fallback_next_id + 1}"
+            self._fallback_next_id += 1
+            self._names.append(name)
+            self._counts.append(0)
+            self._centroids.append(np.zeros(0, dtype=np.float32))
+            return name
+
+        match = self._match(embedding)
+        if match is None:
+            return self._new_speaker(embedding)
+
+        # Fold this embedding into the matched centroid (running mean).
+        n = self._counts[match]
+        c = self._centroids[match]
+        self._centroids[match] = (c * n + embedding) / (n + 1)
+        self._counts[match] = n + 1
+        return self._names[match]
+
+
+def _fmt_timestamp(seconds: float) -> str:
+    if seconds < 0 or seconds != seconds:  # negative or NaN
+        seconds = 0.0
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 # ---------------------------------------------------------------------------
@@ -390,8 +506,15 @@ def transcribe_file(p: Path, out: Path, progress=_noop):
 # Batch transcription — diarized
 # ---------------------------------------------------------------------------
 
-def transcribe_file_diarized(p: Path, out: Path, progress=_noop):
+def transcribe_file_diarized(
+    p: Path,
+    out: Path,
+    progress=_noop,
+    speaker_hint: dict | None = None,
+):
     log(f"Diarized file job started: {p.name}")
+    if speaker_hint:
+        log(f"Speaker hint: {speaker_hint}")
     duration = get_duration(p)
     tmpdir = Path(tempfile.mkdtemp(prefix="whisper_diar_"))
 
@@ -403,25 +526,27 @@ def transcribe_file_diarized(p: Path, out: Path, progress=_noop):
         w = len(str(total))
         t0 = time.time()
 
-        speaker_map: dict[str, str] = {}
-        speaker_counter = 0
+        tracker = GlobalSpeakerTracker()
         merged_lines: list[str] = []
-        last_speaker = None
+        last_speaker: str | None = None
         last_text_parts: list[str] = []
+        last_start_abs: float | None = None
+        chunk_offset = 0.0  # seconds of source audio before the current chunk
 
         def flush_last():
-            nonlocal last_speaker, last_text_parts
+            nonlocal last_speaker, last_text_parts, last_start_abs
             if last_speaker is None:
                 return
             text = " ".join(x for x in last_text_parts if x).strip()
             if text:
-                merged_lines.append(f"{last_speaker}: {text}")
+                ts = _fmt_timestamp(last_start_abs or 0.0)
+                merged_lines.append(f"[{ts}] {last_speaker}: {text}")
             last_speaker = None
             last_text_parts = []
+            last_start_abs = None
 
         for idx, chunk in enumerate(chunks, 1):
             elapsed_pre = time.time() - t0
-            # ETA estimate: use pace of completed chunks; show "?" on first chunk
             if idx > 1:
                 eta_str = f"  |  ETA ~{fmt_eta((elapsed_pre / (idx - 1)) * (total - idx + 1))}"
             else:
@@ -431,19 +556,22 @@ def transcribe_file_diarized(p: Path, out: Path, progress=_noop):
                 f"  |  elapsed {fmt_elapsed(elapsed_pre)}{eta_str}"
             )
 
-            segments = _diarize_wav(chunk)
+            segments, emb_by_label = _diarize_wav(chunk, speaker_hint=speaker_hint)
             active = [s for s in segments if s[1] - s[0] >= 0.15]
+
+            # Resolve chunk-local labels to stable global names via embeddings.
+            local_to_global: dict[str, str] = {}
+            for _, _, spk in active:
+                if spk in local_to_global:
+                    continue
+                local_to_global[spk] = tracker.assign(spk, emb_by_label.get(spk))
 
             progress(
                 f"Chunk {idx:{w}}/{total}  —  transcribing {len(active)} segment(s) ..."
             )
 
             for i, (st, en, spk) in enumerate(active):
-                if spk not in speaker_map:
-                    speaker_counter += 1
-                    speaker_map[spk] = f"Speaker {speaker_counter}"
-
-                label = speaker_map[spk]
+                label = local_to_global[spk]
                 seg_wav = tmpdir / f"seg_{chunk.stem}_{i:04d}.wav"
                 _extract_wav_segment(chunk, seg_wav, st, en)
 
@@ -453,15 +581,22 @@ def transcribe_file_diarized(p: Path, out: Path, progress=_noop):
                 if not text:
                     continue
 
+                seg_start_abs = chunk_offset + float(st)
+
                 if last_speaker is None:
                     last_speaker = label
                     last_text_parts = [text]
+                    last_start_abs = seg_start_abs
                 elif last_speaker == label:
                     last_text_parts.append(text)
                 else:
                     flush_last()
                     last_speaker = label
                     last_text_parts = [text]
+                    last_start_abs = seg_start_abs
+
+            # Advance chunk offset using the actual decoded chunk duration.
+            chunk_offset += get_duration(chunk)
 
             elapsed = time.time() - t0
             eta = (elapsed / idx) * (total - idx)
@@ -475,7 +610,10 @@ def transcribe_file_diarized(p: Path, out: Path, progress=_noop):
 
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(merged_lines).strip() + "\n", encoding="utf-8")
-        log(f"Diarized job finished in {fmt_elapsed(time.time() - t0)} -> {out.name}")
+        log(
+            f"Diarized job finished in {fmt_elapsed(time.time() - t0)} "
+            f"-> {out.name}  ({len(tracker._names)} speaker(s))"
+        )
 
     finally:
         _cleanup_tmp(tmpdir)
@@ -510,6 +648,22 @@ def recv_line(c, maxb=32768):
             break
         b += x
     return b.decode(errors="replace").strip()
+
+
+def _extract_speaker_hint(d: dict) -> dict | None:
+    """Pull num_speakers / min_speakers / max_speakers out of a socket payload."""
+    hint: dict = {}
+    for k in ("num_speakers", "min_speakers", "max_speakers"):
+        v = d.get(k)
+        if v is None:
+            continue
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            hint[k] = n
+    return hint or None
 
 
 def make_progress_sender(c):
@@ -548,10 +702,11 @@ def client(c):
             d = json.loads(payload)
             p = Path(d["path"])
             out = p.with_name(_sanitize_out_name(p))
+            hint = _extract_speaker_hint(d)
 
             with job_lock:
                 if op == "TRANSCRIBE_FILE_DIARIZED" or d.get("diarize") is True:
-                    transcribe_file_diarized(p, out, progress=progress)
+                    transcribe_file_diarized(p, out, progress=progress, speaker_hint=hint)
                 else:
                     transcribe_file(p, out, progress=progress)
 
@@ -563,6 +718,7 @@ def client(c):
             inc = d.get("include_subfolders", False)
             mir = d.get("mirror_structure", False)
             diarize = (op == "TRANSCRIBE_FOLDER_DIARIZED") or (d.get("diarize") is True)
+            hint = _extract_speaker_hint(d) if diarize else None
 
             files = [p for p in (root.rglob("*") if inc else root.glob("*")) if p.is_file()]
             log(f"Folder job: {len(files)} file(s)")
@@ -578,7 +734,7 @@ def client(c):
                     ).with_suffix(".txt")
 
                     if diarize:
-                        transcribe_file_diarized(f, out, progress=progress)
+                        transcribe_file_diarized(f, out, progress=progress, speaker_hint=hint)
                     else:
                         transcribe_file(f, out, progress=progress)
 

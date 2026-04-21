@@ -77,6 +77,40 @@ def yn(q, default=False):
             return False
 
 
+def ask_speaker_hint() -> dict:
+    """Prompt for speaker count. Returns dict suitable for the socket payload.
+
+    Accepts:
+        blank   -> auto-detect (empty dict)
+        N       -> max_speakers=N (cap; pyannote may find fewer)
+        N-M     -> min_speakers=N, max_speakers=M
+    """
+    while True:
+        raw = input(
+            "Max speakers in recording?  (blank = auto, e.g. '3' or '2-4'): "
+        ).strip()
+        if not raw:
+            return {}
+        if "-" in raw:
+            try:
+                lo, hi = raw.split("-", 1)
+                lo_i, hi_i = int(lo.strip()), int(hi.strip())
+                if lo_i <= 0 or hi_i <= 0 or lo_i > hi_i:
+                    raise ValueError
+                return {"min_speakers": lo_i, "max_speakers": hi_i}
+            except ValueError:
+                print("  Expected a range like '2-4'. Try again.")
+                continue
+        try:
+            n = int(raw)
+            if n <= 0:
+                raise ValueError
+            return {"max_speakers": n}
+        except ValueError:
+            print("  Expected a positive integer or range. Try again.")
+            continue
+
+
 def main(argv):
     if len(argv) < 2:
         print("Usage: transcribe_drop.py <file_or_folder> ...")
@@ -92,10 +126,12 @@ def main(argv):
 
         if p.is_file():
             diar = yn("Add speaker labels (diarization)?", False)
+            hint = ask_speaker_hint() if diar else {}
             if use_daemon:
                 op = "TRANSCRIBE_FILE_DIARIZED" if diar else "TRANSCRIBE_FILE"
+                payload = {"path": str(p), **hint}
                 print(f"\nStarting job — progress will appear below.\n")
-                result = daemon_send_streaming(op + " " + json.dumps({"path": str(p)}))
+                result = daemon_send_streaming(op + " " + json.dumps(payload))
                 print(f"\n{result}")
             else:
                 print("Daemon not running. Start it for GPU batch.")
@@ -107,6 +143,7 @@ def main(argv):
                 mir = yn("Mirror subfolder structure?", True)
 
             diar = yn("Add speaker labels (diarization)?", False)
+            hint = ask_speaker_hint() if diar else {}
 
             if use_daemon:
                 op = "TRANSCRIBE_FOLDER_DIARIZED" if diar else "TRANSCRIBE_FOLDER"
@@ -115,6 +152,7 @@ def main(argv):
                         "path": str(p),
                         "include_subfolders": inc,
                         "mirror_structure": mir,
+                        **hint,
                     }
                 )
                 print(f"\nStarting folder job — progress will appear below.\n")
