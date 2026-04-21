@@ -287,17 +287,151 @@ def _sanitize_out_name(p: Path) -> str:
     return re.sub(r"[^\w\-\. ]+", "_", p.stem) + ".txt"
 
 
-def _extract_wav_segment(src_wav: Path, dst_wav: Path, start_s: float, end_s: float):
+def get_channel_count(path: Path) -> int:
+    """Return channel count of the first audio stream, or 0 if undetectable."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=channels",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True, check=True, timeout=15,
+        )
+        return int(result.stdout.strip() or "0")
+    except Exception:
+        return 0
+
+
+def split_channel(src: Path, tmp: Path, channel_idx: int) -> list[Path]:
+    """Chunk a single channel of the source into 15-min mono 16k WAVs.
+
+    `pan=mono|c0=c<N>` extracts just channel N; works even if source has 2+ channels.
+    """
+    out_pattern = tmp / f"ch{channel_idx}_%03d.wav"
     subprocess.run(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-ss", f"{start_s:.3f}", "-to", f"{end_s:.3f}",
-            "-i", str(src_wav),
-            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
-            str(dst_wav),
+            "-i", str(src),
+            "-vn",
+            "-af", f"pan=mono|c0=c{channel_idx}",
+            "-ar", "16000", "-c:a", "pcm_s16le",
+            "-f", "segment", "-segment_time", str(CHUNK_SECONDS),
+            "-reset_timestamps", "1",
+            str(out_pattern),
         ],
         check=True,
     )
+    return sorted(tmp.glob(f"ch{channel_idx}_*.wav"))
+
+
+# ---------------------------------------------------------------------------
+# One-pass transcription with word-level timestamps
+# ---------------------------------------------------------------------------
+
+def _whisper_words(wav_path: Path) -> list[tuple[float, float, str]]:
+    """Transcribe a chunk once with word-level timestamps.
+
+    Returns flat list of (start, end, text) tuples. VAD is on to skip silence.
+    """
+    segments, _ = _model.transcribe(
+        str(wav_path),
+        language=_language,
+        vad_filter=True,
+        word_timestamps=True,
+    )
+    words: list[tuple[float, float, str]] = []
+    for seg in segments:
+        ws = getattr(seg, "words", None)
+        if ws:
+            for w in ws:
+                try:
+                    words.append((float(w.start), float(w.end), w.word))
+                except (TypeError, ValueError):
+                    continue
+        else:
+            # Fallback when word_timestamps didn't populate words (rare).
+            words.append((float(seg.start), float(seg.end), seg.text))
+    return words
+
+
+def _assign_words_to_diar(
+    words: list[tuple[float, float, str]],
+    diar_segs: list[tuple[float, float, str]],
+) -> list[tuple[float, float, str, str | None]]:
+    """Attach a speaker label to each word by max-overlap with a diar segment.
+
+    Diar segments are assumed sorted by start. Fallback chain for words that
+    don't overlap any segment:
+      1. inherit the previous word's speaker (handles brief unvoiced gaps)
+      2. if we're before any diar segment, snap to the nearest segment by midpoint
+         (prevents dropping opening words when pyannote's first segment starts late)
+    """
+    out: list[tuple[float, float, str, str | None]] = []
+    last_spk: str | None = None
+    for ws, we, wt in words:
+        best_spk, best_ov = None, 0.0
+        for ss, se, sp in diar_segs:
+            if se <= ws:
+                continue
+            if ss >= we:
+                break
+            ov = min(we, se) - max(ws, ss)
+            if ov > best_ov:
+                best_ov = ov
+                best_spk = sp
+
+        if best_spk is not None:
+            spk = best_spk
+        elif last_spk is not None:
+            spk = last_spk
+        elif diar_segs:
+            wm = (ws + we) / 2.0
+            spk = min(diar_segs, key=lambda s: abs((s[0] + s[1]) / 2.0 - wm))[2]
+        else:
+            spk = None
+
+        out.append((ws, we, wt, spk))
+        if spk is not None:
+            last_spk = spk
+    return out
+
+
+def _words_to_turns(
+    annotated: list[tuple[float, float, str, str | None]],
+    chunk_offset: float,
+) -> list[tuple[str, float, str]]:
+    """Group consecutive same-speaker words into turns.
+
+    Returns list of (speaker, absolute_start_seconds, text). Words with a None
+    speaker at the very start (before any diar segment) are dropped.
+    """
+    turns: list[tuple[str, float, str]] = []
+    cur_spk: str | None = None
+    cur_start: float = 0.0
+    cur_parts: list[str] = []
+
+    def flush():
+        if cur_spk is None:
+            return
+        text = "".join(cur_parts).strip()
+        if text:
+            turns.append((cur_spk, cur_start + chunk_offset, text))
+
+    for ws, _we, wt, spk in annotated:
+        if spk is None:
+            continue
+        if spk != cur_spk:
+            flush()
+            cur_spk = spk
+            cur_start = ws
+            cur_parts = [wt]
+        else:
+            cur_parts.append(wt)
+    flush()
+    return turns
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +640,48 @@ def transcribe_file(p: Path, out: Path, progress=_noop):
 # Batch transcription — diarized
 # ---------------------------------------------------------------------------
 
+def _emit_turns_to_lines(
+    turns: list[tuple[str, float, str]],
+    merged_lines: list[str],
+    carry: dict,
+) -> None:
+    """Append turns to merged_lines, merging consecutive same-speaker turns
+    across chunk boundaries. `carry` tracks the pending turn between calls:
+        {"speaker": str|None, "start": float, "parts": list[str]}
+    """
+    for spk, start_abs, text in turns:
+        if not text:
+            continue
+        if carry["speaker"] is None:
+            carry["speaker"] = spk
+            carry["start"] = start_abs
+            carry["parts"] = [text]
+        elif carry["speaker"] == spk:
+            carry["parts"].append(text)
+        else:
+            joined = " ".join(carry["parts"]).strip()
+            if joined:
+                merged_lines.append(
+                    f"[{_fmt_timestamp(carry['start'])}] {carry['speaker']}: {joined}"
+                )
+            carry["speaker"] = spk
+            carry["start"] = start_abs
+            carry["parts"] = [text]
+
+
+def _flush_carry(merged_lines: list[str], carry: dict) -> None:
+    if carry["speaker"] is None:
+        return
+    joined = " ".join(carry["parts"]).strip()
+    if joined:
+        merged_lines.append(
+            f"[{_fmt_timestamp(carry['start'])}] {carry['speaker']}: {joined}"
+        )
+    carry["speaker"] = None
+    carry["start"] = 0.0
+    carry["parts"] = []
+
+
 def transcribe_file_diarized(
     p: Path,
     out: Path,
@@ -528,22 +704,8 @@ def transcribe_file_diarized(
 
         tracker = GlobalSpeakerTracker()
         merged_lines: list[str] = []
-        last_speaker: str | None = None
-        last_text_parts: list[str] = []
-        last_start_abs: float | None = None
-        chunk_offset = 0.0  # seconds of source audio before the current chunk
-
-        def flush_last():
-            nonlocal last_speaker, last_text_parts, last_start_abs
-            if last_speaker is None:
-                return
-            text = " ".join(x for x in last_text_parts if x).strip()
-            if text:
-                ts = _fmt_timestamp(last_start_abs or 0.0)
-                merged_lines.append(f"[{ts}] {last_speaker}: {text}")
-            last_speaker = None
-            last_text_parts = []
-            last_start_abs = None
+        carry: dict = {"speaker": None, "start": 0.0, "parts": []}
+        chunk_offset = 0.0
 
         for idx, chunk in enumerate(chunks, 1):
             elapsed_pre = time.time() - t0
@@ -556,44 +718,31 @@ def transcribe_file_diarized(
                 f"  |  elapsed {fmt_elapsed(elapsed_pre)}{eta_str}"
             )
 
-            segments, emb_by_label = _diarize_wav(chunk, speaker_hint=speaker_hint)
-            active = [s for s in segments if s[1] - s[0] >= 0.15]
+            diar_segs, emb_by_label = _diarize_wav(chunk, speaker_hint=speaker_hint)
+            active = [s for s in diar_segs if s[1] - s[0] >= 0.15]
 
             # Resolve chunk-local labels to stable global names via embeddings.
             local_to_global: dict[str, str] = {}
-            for _, _, spk in active:
-                if spk in local_to_global:
-                    continue
-                local_to_global[spk] = tracker.assign(spk, emb_by_label.get(spk))
+            for _s, _e, spk in active:
+                if spk not in local_to_global:
+                    local_to_global[spk] = tracker.assign(spk, emb_by_label.get(spk))
+
+            # Rewrite segments with global speaker names so word assignment
+            # operates in the stable label space.
+            global_segs = [
+                (s, e, local_to_global[spk]) for (s, e, spk) in active
+            ]
+            global_segs.sort(key=lambda x: x[0])
 
             progress(
-                f"Chunk {idx:{w}}/{total}  —  transcribing {len(active)} segment(s) ..."
+                f"Chunk {idx:{w}}/{total}  —  transcribing whole chunk ..."
             )
 
-            for i, (st, en, spk) in enumerate(active):
-                label = local_to_global[spk]
-                seg_wav = tmpdir / f"seg_{chunk.stem}_{i:04d}.wav"
-                _extract_wav_segment(chunk, seg_wav, st, en)
-
-                segs, _ = _model.transcribe(str(seg_wav), language=_language, vad_filter=True)
-                text = " ".join(s.text.strip() for s in segs).strip()
-
-                if not text:
-                    continue
-
-                seg_start_abs = chunk_offset + float(st)
-
-                if last_speaker is None:
-                    last_speaker = label
-                    last_text_parts = [text]
-                    last_start_abs = seg_start_abs
-                elif last_speaker == label:
-                    last_text_parts.append(text)
-                else:
-                    flush_last()
-                    last_speaker = label
-                    last_text_parts = [text]
-                    last_start_abs = seg_start_abs
+            # One Whisper call per chunk instead of one per diar segment.
+            words = _whisper_words(chunk)
+            annotated = _assign_words_to_diar(words, global_segs)
+            turns = _words_to_turns(annotated, chunk_offset)
+            _emit_turns_to_lines(turns, merged_lines, carry)
 
             # Advance chunk offset using the actual decoded chunk duration.
             chunk_offset += get_duration(chunk)
@@ -606,7 +755,7 @@ def transcribe_file_diarized(
                 f"  |  ETA {fmt_eta(eta)}"
             )
 
-        flush_last()
+        _flush_carry(merged_lines, carry)
 
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(merged_lines).strip() + "\n", encoding="utf-8")
@@ -614,6 +763,94 @@ def transcribe_file_diarized(
             f"Diarized job finished in {fmt_elapsed(time.time() - t0)} "
             f"-> {out.name}  ({len(tracker._names)} speaker(s))"
         )
+
+    finally:
+        _cleanup_tmp(tmpdir)
+
+
+# ---------------------------------------------------------------------------
+# Per-channel transcription (for stereo recordings where each channel is one speaker)
+# ---------------------------------------------------------------------------
+
+def transcribe_file_per_channel(p: Path, out: Path, progress=_noop):
+    log(f"Per-channel job started: {p.name}")
+    channels = get_channel_count(p)
+    if channels < 2:
+        raise RuntimeError(
+            f"per-channel mode requires >=2 audio channels; {p.name} has {channels}"
+        )
+    if channels > 2:
+        log(f"WARNING: {p.name} has {channels} channels; only using first 2")
+
+    duration = get_duration(p)
+    tmpdir = Path(tempfile.mkdtemp(prefix="whisper_perch_"))
+
+    try:
+        dur_str = f"  ({fmt_eta(duration)} source)" if duration else ""
+        progress(f"Splitting per channel{dur_str} ...")
+
+        ch0_chunks = split_channel(p, tmpdir, 0)
+        ch1_chunks = split_channel(p, tmpdir, 1)
+        total = max(len(ch0_chunks), len(ch1_chunks))
+        if total == 0:
+            raise RuntimeError("ffmpeg produced no chunks")
+        w = len(str(total))
+        t0 = time.time()
+
+        merged_lines: list[str] = []
+        carry: dict = {"speaker": None, "start": 0.0, "parts": []}
+        chunk_offset = 0.0
+
+        for idx in range(1, total + 1):
+            elapsed_pre = time.time() - t0
+            if idx > 1:
+                eta_str = f"  |  ETA ~{fmt_eta((elapsed_pre / (idx - 1)) * (total - idx + 1))}"
+            else:
+                eta_str = ""
+            progress(
+                f"Chunk {idx:{w}}/{total}  —  transcribing L+R ..."
+                f"  |  elapsed {fmt_elapsed(elapsed_pre)}{eta_str}"
+            )
+
+            ch0 = ch0_chunks[idx - 1] if idx - 1 < len(ch0_chunks) else None
+            ch1 = ch1_chunks[idx - 1] if idx - 1 < len(ch1_chunks) else None
+
+            # Transcribe each channel once; tag each word with its channel speaker.
+            all_words: list[tuple[float, float, str, str | None]] = []
+            if ch0 is not None:
+                for ws, we, wt in _whisper_words(ch0):
+                    all_words.append((ws, we, wt, "Speaker 1"))
+            if ch1 is not None:
+                for ws, we, wt in _whisper_words(ch1):
+                    all_words.append((ws, we, wt, "Speaker 2"))
+
+            # Sort by start time so interleaved speech comes out in order.
+            all_words.sort(key=lambda x: x[0])
+
+            turns = _words_to_turns(all_words, chunk_offset)
+            _emit_turns_to_lines(turns, merged_lines, carry)
+
+            # Use the longest of the two channel chunks to advance the offset.
+            adv = 0.0
+            if ch0 is not None:
+                adv = max(adv, get_duration(ch0))
+            if ch1 is not None:
+                adv = max(adv, get_duration(ch1))
+            chunk_offset += adv
+
+            elapsed = time.time() - t0
+            eta = (elapsed / idx) * (total - idx)
+            progress(
+                f"Chunk {idx:{w}}/{total}  done"
+                f"  |  elapsed {fmt_elapsed(elapsed)}"
+                f"  |  ETA {fmt_eta(eta)}"
+            )
+
+        _flush_carry(merged_lines, carry)
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(merged_lines).strip() + "\n", encoding="utf-8")
+        log(f"Per-channel job finished in {fmt_elapsed(time.time() - t0)} -> {out.name}")
 
     finally:
         _cleanup_tmp(tmpdir)
@@ -703,9 +940,12 @@ def client(c):
             p = Path(d["path"])
             out = p.with_name(_sanitize_out_name(p))
             hint = _extract_speaker_hint(d)
+            per_channel = bool(d.get("per_channel"))
 
             with job_lock:
-                if op == "TRANSCRIBE_FILE_DIARIZED" or d.get("diarize") is True:
+                if per_channel:
+                    transcribe_file_per_channel(p, out, progress=progress)
+                elif op == "TRANSCRIBE_FILE_DIARIZED" or d.get("diarize") is True:
                     transcribe_file_diarized(p, out, progress=progress, speaker_hint=hint)
                 else:
                     transcribe_file(p, out, progress=progress)
@@ -719,6 +959,7 @@ def client(c):
             mir = d.get("mirror_structure", False)
             diarize = (op == "TRANSCRIBE_FOLDER_DIARIZED") or (d.get("diarize") is True)
             hint = _extract_speaker_hint(d) if diarize else None
+            per_channel_pref = bool(d.get("per_channel"))
 
             files = [p for p in (root.rglob("*") if inc else root.glob("*")) if p.is_file()]
             log(f"Folder job: {len(files)} file(s)")
@@ -733,7 +974,20 @@ def client(c):
                         else (root / FOLDER_OUT_SUBDIR / f.name)
                     ).with_suffix(".txt")
 
-                    if diarize:
+                    # Per-channel is a preference: apply when the file actually
+                    # has >=2 channels, otherwise fall back to regular diarization.
+                    use_per_channel = False
+                    if per_channel_pref and diarize:
+                        if get_channel_count(f) >= 2:
+                            use_per_channel = True
+                        else:
+                            progress(
+                                f"  {f.name} is mono — using normal diarization"
+                            )
+
+                    if use_per_channel:
+                        transcribe_file_per_channel(f, out, progress=progress)
+                    elif diarize:
                         transcribe_file_diarized(f, out, progress=progress, speaker_hint=hint)
                     else:
                         transcribe_file(f, out, progress=progress)

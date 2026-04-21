@@ -1,5 +1,6 @@
 import socket
 import json
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +78,24 @@ def yn(q, default=False):
             return False
 
 
+def get_channel_count(path: Path) -> int:
+    """Return channel count of first audio stream, 0 if undetectable or ffprobe missing."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=channels",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True, check=True, timeout=15,
+        )
+        return int(result.stdout.strip() or "0")
+    except Exception:
+        return 0
+
+
 def ask_speaker_hint() -> dict:
     """Prompt for speaker count. Returns dict suitable for the socket payload.
 
@@ -126,10 +145,22 @@ def main(argv):
 
         if p.is_file():
             diar = yn("Add speaker labels (diarization)?", False)
-            hint = ask_speaker_hint() if diar else {}
+            hint: dict = {}
+            per_channel = False
+            if diar:
+                ch = get_channel_count(p)
+                if ch >= 2:
+                    per_channel = yn(
+                        f"File has {ch} audio channel(s). Treat each channel as a separate speaker?",
+                        False,
+                    )
+                if not per_channel:
+                    hint = ask_speaker_hint()
             if use_daemon:
                 op = "TRANSCRIBE_FILE_DIARIZED" if diar else "TRANSCRIBE_FILE"
                 payload = {"path": str(p), **hint}
+                if per_channel:
+                    payload["per_channel"] = True
                 print(f"\nStarting job — progress will appear below.\n")
                 result = daemon_send_streaming(op + " " + json.dumps(payload))
                 print(f"\n{result}")
@@ -143,18 +174,27 @@ def main(argv):
                 mir = yn("Mirror subfolder structure?", True)
 
             diar = yn("Add speaker labels (diarization)?", False)
-            hint = ask_speaker_hint() if diar else {}
+            hint = {}
+            per_channel = False
+            if diar:
+                per_channel = yn(
+                    "Use per-channel mode for stereo files? (mono files fall back to normal diarization)",
+                    False,
+                )
+                if not per_channel:
+                    hint = ask_speaker_hint()
 
             if use_daemon:
                 op = "TRANSCRIBE_FOLDER_DIARIZED" if diar else "TRANSCRIBE_FOLDER"
-                payload = json.dumps(
-                    {
-                        "path": str(p),
-                        "include_subfolders": inc,
-                        "mirror_structure": mir,
-                        **hint,
-                    }
-                )
+                payload_dict = {
+                    "path": str(p),
+                    "include_subfolders": inc,
+                    "mirror_structure": mir,
+                    **hint,
+                }
+                if per_channel:
+                    payload_dict["per_channel"] = True
+                payload = json.dumps(payload_dict)
                 print(f"\nStarting folder job — progress will appear below.\n")
                 result = daemon_send_streaming(op + " " + payload)
                 print(f"\n{result}")
