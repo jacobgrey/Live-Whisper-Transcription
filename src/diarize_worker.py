@@ -5,7 +5,7 @@ Intentionally imports NO ctranslate2 / faster-whisper code so that
 PyTorch's cuDNN context owns the GPU without DLL conflicts on Windows.
 
 Usage (called by whisper_daemon.py):
-    python diarize_worker.py <wav_path> [--cpu]
+    python diarize_worker.py <wav_path> [--cpu] [--silero-vad]
                              [--num-speakers N | --max-speakers N [--min-speakers M]]
 
 Exits 0 on success and prints a JSON object to stdout:
@@ -42,10 +42,55 @@ def _parse_args(argv):
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("wav_path")
     p.add_argument("--cpu", action="store_true")
+    p.add_argument("--silero-vad", action="store_true")
     p.add_argument("--num-speakers", type=int, default=None)
     p.add_argument("--min-speakers", type=int, default=None)
     p.add_argument("--max-speakers", type=int, default=None)
     return p.parse_args(argv)
+
+
+def _run_silero_vad(wav_path: str) -> list[tuple[float, float]] | None:
+    """Return speech regions (start_s, end_s) from Silero VAD, or None on failure."""
+    try:
+        from silero_vad import load_silero_vad, get_speech_timestamps, read_audio
+    except Exception as e:
+        sys.stderr.write(f"[diarize_worker] silero-vad not available ({e}); skipping\n")
+        return None
+    try:
+        model = load_silero_vad()
+        audio = read_audio(wav_path, sampling_rate=16000)
+        stamps = get_speech_timestamps(audio, model, sampling_rate=16000)
+        return [(s["start"] / 16000.0, s["end"] / 16000.0) for s in stamps]
+    except Exception as e:
+        sys.stderr.write(f"[diarize_worker] silero VAD run failed: {e}\n")
+        return None
+
+
+def _filter_by_speech_overlap(
+    segments: list[dict],
+    speech_regions: list[tuple[float, float]],
+    min_overlap_ratio: float = 0.4,
+) -> list[dict]:
+    """Keep diar segments whose overlap with speech regions >= min_overlap_ratio.
+    Drops phantom speakers pyannote sometimes creates from ambient noise."""
+    if not speech_regions:
+        return segments
+    kept = []
+    for seg in segments:
+        s, e = float(seg["start"]), float(seg["end"])
+        dur = e - s
+        if dur <= 0:
+            continue
+        overlap = 0.0
+        for rs, re_ in speech_regions:
+            if re_ <= s:
+                continue
+            if rs >= e:
+                break
+            overlap += min(e, re_) - max(s, rs)
+        if overlap / dur >= min_overlap_ratio:
+            kept.append(seg)
+    return kept
 
 
 def main():
@@ -156,6 +201,15 @@ def main():
         {"start": float(t.start), "end": float(t.end), "speaker": str(spk)}
         for t, _, spk in diar.itertracks(yield_label=True)
     ]
+
+    if args.silero_vad:
+        speech = _run_silero_vad(wav_path)
+        if speech is not None:
+            before = len(segments)
+            segments = _filter_by_speech_overlap(segments, speech)
+            sys.stderr.write(
+                f"[diarize_worker] silero VAD filtered {before - len(segments)}/{before} segments\n"
+            )
 
     print(json.dumps({"segments": segments, "embeddings": embeddings_out}))
     sys.exit(0)

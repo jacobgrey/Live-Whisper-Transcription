@@ -57,6 +57,24 @@ DIARIZE_WORKER = Path(__file__).with_name("diarize_worker.py")
 # same speaker and ~0.1-0.4 for different speakers; 0.55 balances both. Overridable.
 SPEAKER_MATCH_THRESHOLD = float(os.environ.get("SPEAKER_MATCH_THRESHOLD", "0.55"))
 
+# Audio cleanup filter chain:
+# - highpass=80  : cut rumble, HVAC, mic handling (below voice fundamental)
+# - acompressor  : gentle 2:1 compression to even within-speaker dynamics
+# - loudnorm     : normalize to -16 LUFS so pyannote embeddings don't drift
+#                  when a speaker is sometimes loud and sometimes quiet
+AUDIO_CLEANUP_FILTER = (
+    "highpass=f=80,"
+    "acompressor=threshold=-18dB:ratio=2:attack=5:release=50,"
+    "loudnorm=I=-16:TP=-1.5:LRA=11"
+)
+
+# Silence-aware chunking: detect silence >= MIN_SILENCE_SEC below NOISE_DB,
+# snap each 15-minute target boundary to the nearest silence mid-point within
+# BOUNDARY_WINDOW_SEC. Prevents word-straddling at chunk seams.
+SILENCE_NOISE_DB = int(os.environ.get("SILENCE_NOISE_DB", "-30"))
+SILENCE_MIN_SEC = float(os.environ.get("SILENCE_MIN_SEC", "0.5"))
+BOUNDARY_WINDOW_SEC = float(os.environ.get("BOUNDARY_WINDOW_SEC", "30"))
+
 _language = "en"
 _model = None
 _recording = False
@@ -264,22 +282,130 @@ def STOP():
 # Audio splitting
 # ---------------------------------------------------------------------------
 
-def split(src: Path, tmp: Path):
-    log(f"Splitting {src.name}")
-    out = tmp / "chunk_%03d.wav"
-    subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", str(src),
-            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
-            "-f", "segment", "-segment_time", str(CHUNK_SECONDS),
-            "-reset_timestamps", "1",
-            str(out),
-        ],
-        check=True,
+def _find_silence_regions(src: Path) -> list[tuple[float, float]]:
+    """Run ffmpeg silencedetect on the raw input and return (start, end) pairs.
+
+    For multi-stream files (e.g. OBS mic + Discord), mixes all audio streams
+    before detecting so a boundary only lands in silence when *every* stream
+    is quiet — otherwise a silent mic while Discord talks would create bad cuts.
+    """
+    silence_filter = (
+        f"silencedetect=noise={SILENCE_NOISE_DB}dB:duration={SILENCE_MIN_SEC}"
     )
+    streams = probe_audio_streams(src)
+    if len(streams) >= 2:
+        inputs = "".join(f"[0:a:{i}]" for i in range(len(streams)))
+        fc = f"{inputs}amix=inputs={len(streams)}:normalize=0[m];[m]{silence_filter}"
+        cmd = [
+            "ffmpeg", "-hide_banner", "-nostats",
+            "-i", str(src),
+            "-filter_complex", fc,
+            "-f", "null", "-",
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-nostats",
+            "-i", str(src),
+            "-af", silence_filter,
+            "-f", "null", "-",
+        ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    regions: list[tuple[float, float]] = []
+    cur_start: float | None = None
+    for line in result.stderr.splitlines():
+        m = re.search(r"silence_start:\s*([\d.]+)", line)
+        if m:
+            cur_start = float(m.group(1))
+            continue
+        m = re.search(r"silence_end:\s*([\d.]+)", line)
+        if m and cur_start is not None:
+            regions.append((cur_start, float(m.group(1))))
+            cur_start = None
+    return regions
+
+
+def _compute_silence_boundaries(
+    total_duration: float,
+    silences: list[tuple[float, float]],
+    target_chunk_sec: float = CHUNK_SECONDS,
+    window_sec: float = BOUNDARY_WINDOW_SEC,
+) -> list[float]:
+    """For each target boundary (target_chunk_sec * k), snap to the nearest
+    silence mid-point within +/- window_sec. Returns the boundary list
+    (excluding 0 and total_duration)."""
+    if total_duration <= target_chunk_sec:
+        return []
+    boundaries: list[float] = []
+    target = target_chunk_sec
+    while target < total_duration:
+        best = target
+        best_dist = window_sec + 1.0
+        for ss, se in silences:
+            mid = (ss + se) / 2.0
+            dist = abs(mid - target)
+            if dist < best_dist:
+                best_dist = dist
+                best = mid
+        # Only commit a snapped boundary if it was within the window.
+        if best_dist <= window_sec and best > (boundaries[-1] if boundaries else 0.0) + 1.0:
+            boundaries.append(best)
+        else:
+            boundaries.append(target)
+        target += target_chunk_sec
+    return boundaries
+
+
+def _base_split_cmd(src: Path, audio_cleanup: bool) -> list[str]:
+    """Common ffmpeg prefix for the cleanup/split pipeline."""
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", str(src),
+    ]
+
+
+def _segment_args(duration: float, silence_aware: bool, silences: list) -> list[str]:
+    """Return the segment-muxer time arguments. Uses -segment_times when
+    silence-aware mode has something to snap to, otherwise fixed -segment_time."""
+    if silence_aware:
+        boundaries = _compute_silence_boundaries(duration, silences)
+        if boundaries:
+            return ["-segment_times", ",".join(f"{b:.3f}" for b in boundaries)]
+    return ["-segment_time", str(CHUNK_SECONDS)]
+
+
+def split(
+    src: Path,
+    tmp: Path,
+    audio_cleanup: bool = False,
+    silence_aware: bool = False,
+) -> list[Path]:
+    log(f"Splitting {src.name}  (cleanup={audio_cleanup}, silence_aware={silence_aware})")
+    out = tmp / "chunk_%03d.wav"
+
+    silences: list[tuple[float, float]] = []
+    duration = 0.0
+    if silence_aware:
+        duration = get_duration(src)
+        silences = _find_silence_regions(src)
+        log(f"  silencedetect: {len(silences)} silent region(s)")
+
+    af_parts: list[str] = []
+    if audio_cleanup:
+        af_parts.append(AUDIO_CLEANUP_FILTER)
+
+    cmd = _base_split_cmd(src, audio_cleanup) + ["-vn"]
+    if af_parts:
+        cmd += ["-af", ",".join(af_parts)]
+    cmd += [
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+        "-f", "segment",
+        *_segment_args(duration, silence_aware, silences),
+        "-reset_timestamps", "1",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True)
     chunks = sorted(tmp.glob("chunk_*.wav"))
-    log(f"{len(chunks)} chunk(s) created")
+    log(f"  {len(chunks)} chunk(s) created")
     return chunks
 
 
@@ -336,30 +462,48 @@ def _speaker_tracks_for(path: Path) -> list[dict]:
     return []
 
 
-def split_track(src: Path, tmp: Path, track: dict, track_idx: int) -> list[Path]:
-    """Extract one track (stream or channel) as mono 16k 15-min chunks."""
+def split_track(
+    src: Path,
+    tmp: Path,
+    track: dict,
+    track_idx: int,
+    audio_cleanup: bool = False,
+    silence_aware: bool = False,
+    silences: list[tuple[float, float]] | None = None,
+    duration: float = 0.0,
+) -> list[Path]:
+    """Extract one track (stream or channel) as mono 16k chunks.
+
+    `silences` and `duration` should be pre-computed by the caller when
+    silence_aware=True (shared across all tracks of the same file)."""
     out_pattern = tmp / f"t{track_idx}_%03d.wav"
+    pre: list[str] = []
+    af_parts: list[str] = []
+
     if track["kind"] == "stream":
         # Downmix the whole stream to mono. Handles the L==R duplicated-mono
         # case (common for OBS mic streams) correctly.
-        extra = ["-map", f"0:a:{track['index']}", "-ac", "1"]
+        pre = ["-map", f"0:a:{track['index']}", "-ac", "1"]
     elif track["kind"] == "channel":
-        extra = ["-vn", "-af", f"pan=mono|c0=c{track['index']}"]
+        pre = ["-vn"]
+        af_parts.append(f"pan=mono|c0=c{track['index']}")
     else:
         raise ValueError(f"unknown track kind: {track['kind']!r}")
 
-    subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", str(src),
-            *extra,
-            "-ar", "16000", "-c:a", "pcm_s16le",
-            "-f", "segment", "-segment_time", str(CHUNK_SECONDS),
-            "-reset_timestamps", "1",
-            str(out_pattern),
-        ],
-        check=True,
-    )
+    if audio_cleanup:
+        af_parts.append(AUDIO_CLEANUP_FILTER)
+
+    cmd = _base_split_cmd(src, audio_cleanup) + pre
+    if af_parts:
+        cmd += ["-af", ",".join(af_parts)]
+    cmd += [
+        "-ar", "16000", "-c:a", "pcm_s16le",
+        "-f", "segment",
+        *_segment_args(duration, silence_aware, silences or []),
+        "-reset_timestamps", "1",
+        str(out_pattern),
+    ]
+    subprocess.run(cmd, check=True)
     return sorted(tmp.glob(f"t{track_idx}_*.wav"))
 
 
@@ -507,16 +651,22 @@ def _diarize_wav(
     wav_path: Path,
     use_cpu: bool = False,
     speaker_hint: dict | None = None,
+    silero_vad: bool = False,
 ) -> tuple[list[tuple[float, float, str]], dict[str, np.ndarray]]:
     """Run diarization subprocess. Returns (segments, embeddings_by_local_label).
 
     `speaker_hint` may contain any of: num_speakers, min_speakers, max_speakers.
+    `silero_vad` asks the worker to pre-compute Silero speech regions and drop
+    pyannote segments that don't meaningfully overlap them (reduces phantom
+    speakers from noise).
     `embeddings_by_local_label` maps each chunk-local SPEAKER_xx to its 1-D numpy
     embedding vector, or is empty if the pipeline didn't return embeddings.
     """
     cmd = [sys.executable, str(DIARIZE_WORKER), str(wav_path)]
     if use_cpu:
         cmd.append("--cpu")
+    if silero_vad:
+        cmd.append("--silero-vad")
 
     if speaker_hint:
         if speaker_hint.get("num_speakers") is not None:
@@ -664,7 +814,13 @@ def _fmt_timestamp(seconds: float) -> str:
 # Batch transcription — plain
 # ---------------------------------------------------------------------------
 
-def transcribe_file(p: Path, out: Path, progress=_noop):
+def transcribe_file(
+    p: Path,
+    out: Path,
+    progress=_noop,
+    audio_cleanup: bool = False,
+    silence_aware: bool = False,
+):
     log(f"File job started: {p.name}")
     duration = get_duration(p)
     tmpdir = Path(tempfile.mkdtemp(prefix="whisper_"))
@@ -672,7 +828,7 @@ def transcribe_file(p: Path, out: Path, progress=_noop):
     try:
         dur_str = f"  ({fmt_eta(duration)} source)" if duration else ""
         progress(f"Splitting audio{dur_str} ...")
-        chunks = split(p, tmpdir)
+        chunks = split(p, tmpdir, audio_cleanup=audio_cleanup, silence_aware=silence_aware)
         total = len(chunks)
         w = len(str(total))
         t0 = time.time()
@@ -750,6 +906,9 @@ def transcribe_file_diarized(
     out: Path,
     progress=_noop,
     speaker_hint: dict | None = None,
+    audio_cleanup: bool = False,
+    silence_aware: bool = False,
+    silero_vad: bool = False,
 ):
     log(f"Diarized file job started: {p.name}")
     if speaker_hint:
@@ -760,7 +919,7 @@ def transcribe_file_diarized(
     try:
         dur_str = f"  ({fmt_eta(duration)} source)" if duration else ""
         progress(f"Splitting audio{dur_str} ...")
-        chunks = split(p, tmpdir)
+        chunks = split(p, tmpdir, audio_cleanup=audio_cleanup, silence_aware=silence_aware)
         total = len(chunks)
         w = len(str(total))
         t0 = time.time()
@@ -781,7 +940,9 @@ def transcribe_file_diarized(
                 f"  |  elapsed {fmt_elapsed(elapsed_pre)}{eta_str}"
             )
 
-            diar_segs, emb_by_label = _diarize_wav(chunk, speaker_hint=speaker_hint)
+            diar_segs, emb_by_label = _diarize_wav(
+                chunk, speaker_hint=speaker_hint, silero_vad=silero_vad
+            )
             active = [s for s in diar_segs if s[1] - s[0] >= 0.15]
 
             # Resolve chunk-local labels to stable global names via embeddings.
@@ -840,6 +1001,9 @@ def transcribe_file_multi_track(
     out: Path,
     progress=_noop,
     track_speakers: list | None = None,
+    audio_cleanup: bool = False,
+    silence_aware: bool = False,
+    silero_vad: bool = False,
 ):
     """Transcribe a file with independent per-speaker audio tracks.
 
@@ -884,9 +1048,22 @@ def transcribe_file_multi_track(
         dur_str = f"  ({fmt_eta(duration)} source)" if duration else ""
         progress(f"Splitting {kind_summary}{dur_str} ...")
 
+        # Silence detection is done once on the source (raw) and reused for
+        # every track so all tracks share the same chunk boundaries in source time.
+        silences: list[tuple[float, float]] = []
+        if silence_aware:
+            silences = _find_silence_regions(p)
+            log(f"  silencedetect: {len(silences)} silent region(s)")
+
         track_chunks: list[list[Path]] = []
         for t_idx, track in enumerate(tracks):
-            track_chunks.append(split_track(p, tmpdir, track, t_idx))
+            track_chunks.append(split_track(
+                p, tmpdir, track, t_idx,
+                audio_cleanup=audio_cleanup,
+                silence_aware=silence_aware,
+                silences=silences,
+                duration=duration,
+            ))
 
         total = max(len(c) for c in track_chunks)
         if total == 0:
@@ -952,7 +1129,9 @@ def transcribe_file_multi_track(
                 else:
                     # Diarize this track's chunk and assign its words.
                     diar_segs, emb_by_label = _diarize_wav(
-                        chunk_path, speaker_hint=state["sub_hint"]
+                        chunk_path,
+                        speaker_hint=state["sub_hint"],
+                        silero_vad=silero_vad,
                     )
                     active = [s for s in diar_segs if s[1] - s[0] >= 0.15]
 
@@ -1103,16 +1282,32 @@ def client(c):
             hint = _extract_speaker_hint(d)
             multi_track = bool(d.get("multi_track") or d.get("per_channel"))
             track_speakers = _parse_track_speakers(d.get("track_speakers"))
+            audio_cleanup = bool(d.get("audio_cleanup"))
+            silence_aware = bool(d.get("silence_aware"))
+            silero_vad = bool(d.get("silero_vad"))
 
             with job_lock:
                 if multi_track:
                     transcribe_file_multi_track(
-                        p, out, progress=progress, track_speakers=track_speakers
+                        p, out, progress=progress,
+                        track_speakers=track_speakers,
+                        audio_cleanup=audio_cleanup,
+                        silence_aware=silence_aware,
+                        silero_vad=silero_vad,
                     )
                 elif op == "TRANSCRIBE_FILE_DIARIZED" or d.get("diarize") is True:
-                    transcribe_file_diarized(p, out, progress=progress, speaker_hint=hint)
+                    transcribe_file_diarized(
+                        p, out, progress=progress, speaker_hint=hint,
+                        audio_cleanup=audio_cleanup,
+                        silence_aware=silence_aware,
+                        silero_vad=silero_vad,
+                    )
                 else:
-                    transcribe_file(p, out, progress=progress)
+                    transcribe_file(
+                        p, out, progress=progress,
+                        audio_cleanup=audio_cleanup,
+                        silence_aware=silence_aware,
+                    )
 
             resp = f"OK {out}"
 
@@ -1125,6 +1320,9 @@ def client(c):
             hint = _extract_speaker_hint(d) if diarize else None
             multi_track_pref = bool(d.get("multi_track") or d.get("per_channel"))
             track_speakers = _parse_track_speakers(d.get("track_speakers"))
+            audio_cleanup = bool(d.get("audio_cleanup"))
+            silence_aware = bool(d.get("silence_aware"))
+            silero_vad = bool(d.get("silero_vad"))
 
             files = [p for p in (root.rglob("*") if inc else root.glob("*")) if p.is_file()]
             log(f"Folder job: {len(files)} file(s)")
@@ -1154,12 +1352,25 @@ def client(c):
 
                     if use_multi_track:
                         transcribe_file_multi_track(
-                            f, out, progress=progress, track_speakers=track_speakers
+                            f, out, progress=progress,
+                            track_speakers=track_speakers,
+                            audio_cleanup=audio_cleanup,
+                            silence_aware=silence_aware,
+                            silero_vad=silero_vad,
                         )
                     elif diarize:
-                        transcribe_file_diarized(f, out, progress=progress, speaker_hint=hint)
+                        transcribe_file_diarized(
+                            f, out, progress=progress, speaker_hint=hint,
+                            audio_cleanup=audio_cleanup,
+                            silence_aware=silence_aware,
+                            silero_vad=silero_vad,
+                        )
                     else:
-                        transcribe_file(f, out, progress=progress)
+                        transcribe_file(
+                            f, out, progress=progress,
+                            audio_cleanup=audio_cleanup,
+                            silence_aware=silence_aware,
+                        )
 
             resp = f"OK {root / FOLDER_OUT_SUBDIR}"
 

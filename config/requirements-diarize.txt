@@ -1,3 +1,4 @@
 onnxruntime==1.19.2
 pyannote.audio==3.3.2
 matplotlib
+silero-vad>=5.1
