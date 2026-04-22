@@ -282,46 +282,104 @@ def STOP():
 # Audio splitting
 # ---------------------------------------------------------------------------
 
-def _find_silence_regions(src: Path) -> list[tuple[float, float]]:
-    """Run ffmpeg silencedetect on the raw input and return (start, end) pairs.
+def _find_silence_regions(src: Path, progress=_noop) -> list[tuple[float, float]]:
+    """Stream-parse ffmpeg silencedetect output and return (start, end) pairs.
 
-    For multi-stream files (e.g. OBS mic + Discord), mixes all audio streams
-    before detecting so a boundary only lands in silence when *every* stream
-    is quiet — otherwise a silent mic while Discord talks would create bad cuts.
+    - For multi-stream files (e.g. OBS mic + Discord), mixes all audio streams
+      first so a boundary only lands where *every* stream is quiet.
+    - Downsamples to 8 kHz before detection — silence threshold is energy-based,
+      high frequencies don't matter, and this cuts the CPU cost roughly in half
+      on long files.
+    - Reads stderr line-by-line so we can emit progress as regions are found
+      (prevents the "stuck on splitting for 10 min" silent wait).
     """
-    silence_filter = (
-        f"silencedetect=noise={SILENCE_NOISE_DB}dB:duration={SILENCE_MIN_SEC}"
-    )
+    sd = f"silencedetect=noise={SILENCE_NOISE_DB}dB:duration={SILENCE_MIN_SEC}"
     streams = probe_audio_streams(src)
     if len(streams) >= 2:
         inputs = "".join(f"[0:a:{i}]" for i in range(len(streams)))
-        fc = f"{inputs}amix=inputs={len(streams)}:normalize=0[m];[m]{silence_filter}"
+        fc = f"{inputs}amix=inputs={len(streams)}:normalize=0[m];[m]{sd}"
         cmd = [
-            "ffmpeg", "-hide_banner", "-nostats",
+            "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "info",
             "-i", str(src),
             "-filter_complex", fc,
             "-f", "null", "-",
         ]
     else:
         cmd = [
-            "ffmpeg", "-hide_banner", "-nostats",
+            "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "info",
             "-i", str(src),
-            "-af", silence_filter,
+            "-af", sd,
             "-f", "null", "-",
         ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
     regions: list[tuple[float, float]] = []
     cur_start: float | None = None
-    for line in result.stderr.splitlines():
-        m = re.search(r"silence_start:\s*([\d.]+)", line)
-        if m:
-            cur_start = float(m.group(1))
-            continue
-        m = re.search(r"silence_end:\s*([\d.]+)", line)
-        if m and cur_start is not None:
-            regions.append((cur_start, float(m.group(1))))
-            cur_start = None
+    last_emit = 0
+    try:
+        for line in proc.stderr:  # type: ignore[union-attr]
+            m = re.search(r"silence_start:\s*([\d.]+)", line)
+            if m:
+                cur_start = float(m.group(1))
+                continue
+            m = re.search(r"silence_end:\s*([\d.]+)", line)
+            if m and cur_start is not None:
+                end_s = float(m.group(1))
+                regions.append((cur_start, end_s))
+                cur_start = None
+                if len(regions) - last_emit >= 50:
+                    progress(
+                        f"  silencedetect: scanned to {fmt_elapsed(end_s)}, "
+                        f"{len(regions)} silence(s) found"
+                    )
+                    last_emit = len(regions)
+    finally:
+        proc.wait()
+    if proc.returncode not in (0, None):
+        # Non-fatal: empty regions means we fall back to fixed 15-min boundaries.
+        log(f"silencedetect exited {proc.returncode}; using fixed chunk boundaries")
+        return []
     return regions
+
+
+def _run_ffmpeg_with_progress(cmd: list, duration: float, progress, label: str):
+    """Run ffmpeg, emitting percent-done updates parsed from -progress pipe:1.
+
+    Inserts -progress/-nostats/-loglevel before the first positional arg so
+    callers build their command naturally. Raises CalledProcessError on failure
+    with captured stderr in the exception.
+    """
+    augmented = cmd[:1] + [
+        "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+    ] + cmd[1:]
+    proc = subprocess.Popen(
+        augmented, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+    last_pct = -1
+    try:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            line = line.strip()
+            if line.startswith("out_time_us="):
+                try:
+                    us = int(line.split("=", 1)[1])
+                except ValueError:
+                    continue
+                if duration > 0:
+                    pct = int(100 * (us / 1_000_000) / duration)
+                    if pct >= last_pct + 5:
+                        progress(f"  {label}: {pct}%")
+                        last_pct = pct
+            elif line == "progress=end":
+                break
+    finally:
+        proc.wait()
+    stderr_txt = proc.stderr.read() if proc.stderr else ""
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, augmented, stderr=stderr_txt)
 
 
 def _compute_silence_boundaries(
@@ -378,16 +436,17 @@ def split(
     tmp: Path,
     audio_cleanup: bool = False,
     silence_aware: bool = False,
+    progress=_noop,
 ) -> list[Path]:
     log(f"Splitting {src.name}  (cleanup={audio_cleanup}, silence_aware={silence_aware})")
     out = tmp / "chunk_%03d.wav"
 
+    duration = get_duration(src)
     silences: list[tuple[float, float]] = []
-    duration = 0.0
     if silence_aware:
-        duration = get_duration(src)
-        silences = _find_silence_regions(src)
-        log(f"  silencedetect: {len(silences)} silent region(s)")
+        progress("Running silence detection ...")
+        silences = _find_silence_regions(src, progress=progress)
+        progress(f"silencedetect: {len(silences)} silent region(s) found")
 
     af_parts: list[str] = []
     if audio_cleanup:
@@ -403,7 +462,8 @@ def split(
         "-reset_timestamps", "1",
         str(out),
     ]
-    subprocess.run(cmd, check=True)
+    progress("ffmpeg split starting ...")
+    _run_ffmpeg_with_progress(cmd, duration, progress, label="split")
     chunks = sorted(tmp.glob("chunk_*.wav"))
     log(f"  {len(chunks)} chunk(s) created")
     return chunks
@@ -471,6 +531,7 @@ def split_track(
     silence_aware: bool = False,
     silences: list[tuple[float, float]] | None = None,
     duration: float = 0.0,
+    progress=_noop,
 ) -> list[Path]:
     """Extract one track (stream or channel) as mono 16k chunks.
 
@@ -503,7 +564,9 @@ def split_track(
         "-reset_timestamps", "1",
         str(out_pattern),
     ]
-    subprocess.run(cmd, check=True)
+    _run_ffmpeg_with_progress(
+        cmd, duration, progress, label=f"track {track_idx + 1} split"
+    )
     return sorted(tmp.glob(f"t{track_idx}_*.wav"))
 
 
@@ -828,7 +891,11 @@ def transcribe_file(
     try:
         dur_str = f"  ({fmt_eta(duration)} source)" if duration else ""
         progress(f"Splitting audio{dur_str} ...")
-        chunks = split(p, tmpdir, audio_cleanup=audio_cleanup, silence_aware=silence_aware)
+        chunks = split(
+            p, tmpdir,
+            audio_cleanup=audio_cleanup, silence_aware=silence_aware,
+            progress=progress,
+        )
         total = len(chunks)
         w = len(str(total))
         t0 = time.time()
@@ -919,7 +986,11 @@ def transcribe_file_diarized(
     try:
         dur_str = f"  ({fmt_eta(duration)} source)" if duration else ""
         progress(f"Splitting audio{dur_str} ...")
-        chunks = split(p, tmpdir, audio_cleanup=audio_cleanup, silence_aware=silence_aware)
+        chunks = split(
+            p, tmpdir,
+            audio_cleanup=audio_cleanup, silence_aware=silence_aware,
+            progress=progress,
+        )
         total = len(chunks)
         w = len(str(total))
         t0 = time.time()
@@ -1052,17 +1123,20 @@ def transcribe_file_multi_track(
         # every track so all tracks share the same chunk boundaries in source time.
         silences: list[tuple[float, float]] = []
         if silence_aware:
-            silences = _find_silence_regions(p)
-            log(f"  silencedetect: {len(silences)} silent region(s)")
+            progress("Running silence detection ...")
+            silences = _find_silence_regions(p, progress=progress)
+            progress(f"silencedetect: {len(silences)} silent region(s) found")
 
         track_chunks: list[list[Path]] = []
         for t_idx, track in enumerate(tracks):
+            progress(f"Splitting track {t_idx + 1}/{len(tracks)} ({track['label']}) ...")
             track_chunks.append(split_track(
                 p, tmpdir, track, t_idx,
                 audio_cleanup=audio_cleanup,
                 silence_aware=silence_aware,
                 silences=silences,
                 duration=duration,
+                progress=progress,
             ))
 
         total = max(len(c) for c in track_chunks)
