@@ -218,19 +218,19 @@ def main(argv):
         if p.is_file():
             audio_cleanup = yn(
                 "Apply audio cleanup? (highpass + gentle compressor + loudness norm)",
-                False,
+                True,
             )
             silence_aware = yn(
                 "Use silence-aware chunk boundaries? (snap 15-min cuts to silences)",
-                False,
+                True,
             )
 
-            diar = yn("Add speaker labels (diarization)?", False)
+            diar = yn("Add speaker labels (diarization)?", True)
             silero_vad = False
             if diar:
                 silero_vad = yn(
                     "Use Silero VAD to drop noise-triggered phantom speakers?",
-                    False,
+                    True,
                 )
             hint: dict = {}
             multi_track = False
@@ -287,19 +287,19 @@ def main(argv):
 
             audio_cleanup = yn(
                 "Apply audio cleanup to every file? (highpass + compressor + loudnorm)",
-                False,
+                True,
             )
             silence_aware = yn(
                 "Use silence-aware chunk boundaries?",
-                False,
+                True,
             )
 
-            diar = yn("Add speaker labels (diarization)?", False)
+            diar = yn("Add speaker labels (diarization)?", True)
             silero_vad = False
             if diar:
                 silero_vad = yn(
                     "Use Silero VAD to drop noise-triggered phantom speakers?",
-                    False,
+                    True,
                 )
             hint = {}
             multi_track = False
