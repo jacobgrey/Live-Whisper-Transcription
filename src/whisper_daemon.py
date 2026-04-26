@@ -84,6 +84,16 @@ _shutdown = threading.Event()
 _input_device = None          # None = system default; int device index
 job_lock = threading.Lock()
 
+# Forced-alignment model (wav2vec2 CTC). Lazily loaded; English-only.
+# Used to refine Whisper word timestamps to ~20 ms precision so speaker
+# transitions don't misattribute the first/last word of a turn.
+_align_model = None
+_align_dict: dict = {}
+_align_blank: int = 0
+# Max distance to snap a pyannote turn boundary to a word edge. 0.3s captures
+# pyannote's typical jitter without crossing any meaningful turn.
+BOUNDARY_SNAP_SEC = float(os.environ.get("BOUNDARY_SNAP_SEC", "0.3"))
+
 DEVICE_CONFIG = PROJECT_ROOT / "config" / "input_device.txt"
 
 
@@ -223,6 +233,193 @@ def load_model():
         log(f"GPU load failed ({e}) — falling back to CPU")
         _model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
         log("Model loaded on CPU")
+    # Preload alignment model so the first diarized chunk doesn't pay the cost.
+    _load_align_model()
+
+
+# ---------------------------------------------------------------------------
+# wav2vec2 CTC forced alignment — refines Whisper word timestamps so that
+# turn boundaries are placed accurately enough for diarization assignment.
+# ---------------------------------------------------------------------------
+
+def _load_align_model():
+    """Lazy-load the wav2vec2 forced-alignment model (English-only)."""
+    global _align_model, _align_dict, _align_blank
+    if _align_model is not None:
+        return
+    try:
+        import torch
+        import torchaudio
+    except Exception as e:
+        log(f"Forced alignment unavailable ({e}); using Whisper word timings as-is")
+        return
+    try:
+        log("Loading wav2vec2 alignment model...")
+        bundle = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
+        model = bundle.get_model()
+        if torch.cuda.is_available():
+            try:
+                model = model.to("cuda")
+            except Exception as e:
+                log(f"  align model GPU move failed ({e}); using CPU")
+        model.eval()
+        labels = bundle.get_labels()  # ('-', '|', 'E', 'T', ...)
+        _align_model = model
+        _align_dict = {c: i for i, c in enumerate(labels)}
+        _align_blank = labels.index("-") if "-" in labels else 0
+        log(f"  alignment model loaded ({len(labels)} tokens)")
+    except Exception as e:
+        log(f"  alignment model load failed ({e}); falling back to Whisper timings")
+        _align_model = None
+
+
+def _align_words_wav2vec2(
+    wav_path: Path,
+    words: list[tuple[float, float, str]],
+) -> list[tuple[float, float, str]]:
+    """Refine Whisper word timestamps to frame-precise edges via wav2vec2.
+
+    Whisper's word `start` is often biased earlier than the actual onset
+    (especially the first word of a Whisper segment, which gets snapped to
+    the VAD region start). That bias is the dominant cause of mid-word
+    misattribution at speaker transitions. CTC forced alignment gives ~20 ms
+    accurate edges instead. Falls back to original timestamps on any failure.
+    """
+    if not words or _align_model is None:
+        return words
+    try:
+        import torch
+        import torchaudio
+        import torchaudio.functional as F_audio
+    except Exception:
+        return words
+
+    try:
+        waveform, sr = torchaudio.load(str(wav_path))
+    except Exception:
+        return words
+    if sr != 16000:
+        waveform = torchaudio.functional.resample(waveform, sr, 16000)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(0, keepdim=True)
+
+    device = next(_align_model.parameters()).device
+
+    # Words with no alignable characters (digits, all-punctuation) keep their
+    # original Whisper timing — wav2vec2 vocab is uppercase letters + apostrophe.
+    word_tokens: list[list[int]] = []
+    for _, _, wt in words:
+        clean = re.sub(r"[^A-Z']", "", wt.upper())
+        word_tokens.append([_align_dict[c] for c in clean if c in _align_dict])
+
+    # Insert wav2vec2's word-separator token between words. Without it,
+    # inter-word silence gets absorbed into adjacent letter spans, blurring
+    # edges by ~50-100 ms. word_token_ranges deliberately exclude the
+    # separator so per-word slicing only spans the word's letters.
+    sep_id = _align_dict.get("|")
+    flat: list[int] = []
+    word_token_ranges: list[tuple[int, int]] = []
+    for i, toks in enumerate(word_tokens):
+        start = len(flat)
+        flat.extend(toks)
+        word_token_ranges.append((start, len(flat)))
+        if (
+            sep_id is not None
+            and toks
+            and i < len(word_tokens) - 1
+            and word_tokens[i + 1]
+        ):
+            flat.append(sep_id)
+
+    if not flat:
+        return words
+
+    try:
+        wav_d = waveform.to(device)
+        targets = torch.tensor([flat], dtype=torch.int32, device=device)
+        with torch.inference_mode():
+            emissions, _ = _align_model(wav_d)
+            emissions = torch.log_softmax(emissions, dim=-1)
+        alignments, scores = F_audio.forced_align(
+            emissions, targets, blank=_align_blank
+        )
+        spans = F_audio.merge_tokens(
+            alignments[0], scores[0], blank=_align_blank
+        )
+    except torch.cuda.OutOfMemoryError:
+        log(f"  align OOM on {wav_path.name}; keeping Whisper timings")
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return words
+    except Exception as e:
+        log(f"  forced alignment failed for {wav_path.name}: {e}")
+        return words
+
+    if len(spans) != len(flat):
+        log(f"  align span mismatch ({len(spans)} vs {len(flat)}) for {wav_path.name}; keeping Whisper timings")
+        return words
+
+    n_samples = int(waveform.shape[1])
+    n_frames = int(emissions.shape[1])
+    if n_frames <= 0:
+        return words
+    sec_per_frame = (n_samples / n_frames) / 16000.0
+
+    refined: list[tuple[float, float, str]] = []
+    for i, (orig_s, orig_e, wt) in enumerate(words):
+        ts, te = word_token_ranges[i]
+        if ts == te:
+            refined.append((orig_s, orig_e, wt))
+            continue
+        word_spans = spans[ts:te]
+        s_frame = min(int(sp.start) for sp in word_spans)
+        e_frame = max(int(sp.end) for sp in word_spans)
+        refined.append((s_frame * sec_per_frame, e_frame * sec_per_frame, wt))
+
+    return refined
+
+
+def _snap_diar_boundaries_to_words(
+    diar_segs: list[tuple[float, float, str]],
+    words: list[tuple[float, float, str]],
+    max_snap: float = BOUNDARY_SNAP_SEC,
+) -> list[tuple[float, float, str]]:
+    """Move pyannote turn boundaries to nearest word edge within max_snap.
+
+    Pyannote chooses turn boundaries from a sliding-window segmentation that
+    is independent of word boundaries, so it routinely places a boundary
+    100-300 ms inside a word. Snapping the boundary to the nearest word edge
+    eliminates the straddling word that causes max-overlap misattribution.
+    Only applied between segments belonging to *different* speakers.
+    """
+    if not diar_segs or not words:
+        return diar_segs
+
+    edges = sorted({float(w[0]) for w in words} | {float(w[1]) for w in words})
+    sorted_segs = sorted(diar_segs, key=lambda s: s[0])
+    snapped: list[list] = [list(s) for s in sorted_segs]
+
+    for i in range(len(snapped) - 1):
+        if snapped[i][2] == snapped[i + 1][2]:
+            continue
+        boundary = (snapped[i][1] + snapped[i + 1][0]) / 2.0
+        best = None
+        best_dist = max_snap + 1.0
+        # Linear scan; chunks have <~2k word edges, negligible cost.
+        for edge in edges:
+            d = abs(edge - boundary)
+            if d < best_dist:
+                best_dist = d
+                best = edge
+            elif edge > boundary + max_snap:
+                break
+        if best is not None and best_dist <= max_snap:
+            snapped[i][1] = best
+            snapped[i + 1][0] = best
+
+    return [(s[0], s[1], s[2]) for s in snapped]
 
 
 # ---------------------------------------------------------------------------
@@ -589,10 +786,16 @@ def _avoid_overwrite(out: Path) -> Path:
 # One-pass transcription with word-level timestamps
 # ---------------------------------------------------------------------------
 
-def _whisper_words(wav_path: Path) -> list[tuple[float, float, str]]:
+def _whisper_words(
+    wav_path: Path,
+    align: bool = False,
+) -> list[tuple[float, float, str]]:
     """Transcribe a chunk once with word-level timestamps.
 
     Returns flat list of (start, end, text) tuples. VAD is on to skip silence.
+    When `align=True`, refines word boundaries with wav2vec2 forced alignment;
+    Whisper's own word starts are biased by VAD region rounding and are too
+    coarse for diarization assignment at speaker transitions.
     """
     segments, _ = _model.transcribe(
         str(wav_path),
@@ -612,6 +815,8 @@ def _whisper_words(wav_path: Path) -> list[tuple[float, float, str]]:
         else:
             # Fallback when word_timestamps didn't populate words (rare).
             words.append((float(seg.start), float(seg.end), seg.text))
+    if align and words:
+        words = _align_words_wav2vec2(wav_path, words)
     return words
 
 
@@ -1034,7 +1239,12 @@ def transcribe_file_diarized(
             )
 
             # One Whisper call per chunk instead of one per diar segment.
-            words = _whisper_words(chunk)
+            # align=True refines word edges via wav2vec2 forced alignment so
+            # max-overlap assignment doesn't misattribute boundary words.
+            words = _whisper_words(chunk, align=True)
+            # Snap pyannote turn boundaries to nearby word edges so no word
+            # straddles a speaker change.
+            global_segs = _snap_diar_boundaries_to_words(global_segs, words)
             annotated = _assign_words_to_diar(words, global_segs)
             turns = _words_to_turns(annotated, chunk_offset)
             _emit_turns_to_lines(turns, merged_lines, carry)
@@ -1190,7 +1400,9 @@ def transcribe_file_multi_track(
                 chunk_durations.append(get_duration(chunk_path))
 
                 state = track_state[t_idx]
-                words = _whisper_words(chunk_path)
+                # Solo tracks don't need refined word edges (no boundary to
+                # cross), so only pay the alignment cost on diarized tracks.
+                words = _whisper_words(chunk_path, align=(state["kind"] != "solo"))
                 if not words:
                     continue
 
@@ -1219,6 +1431,8 @@ def transcribe_file_multi_track(
                         (s, e, local_to_global[spk]) for (s, e, spk) in active
                     ]
                     global_segs.sort(key=lambda x: x[0])
+                    # Snap turn boundaries to word edges before assignment.
+                    global_segs = _snap_diar_boundaries_to_words(global_segs, words)
 
                     annotated = _assign_words_to_diar(words, global_segs)
                     for ws, we, wt, spk in annotated:
