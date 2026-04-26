@@ -95,6 +95,10 @@ The setup script handles all other dependencies automatically.
 
 **Slow first transcription:** Normal -- the model takes 15-30 seconds to load on first start. After that, transcriptions are fast.
 
+## Other
+Command for removing video from mkv files
+ffmpeg -i input.mkv -vn -c:a copy output.mkv
+
 ## License
 
 MIT
