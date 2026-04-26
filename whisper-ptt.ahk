@@ -17,6 +17,13 @@ F7::
     Run('cmd /c ""' daemonCmd '" --select-device"')
 }
 
+; Open Explorer to the Transcribe Drop script (drag files onto it)
++F8::
+{
+    dropScript := A_ScriptDir "\scripts\Transcribe Drop.cmd"
+    Run('explorer.exe /select,"' dropScript '"')
+}
+
 F8::
 {
     global py, client
