@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 import shutil
 import sounddevice as sd
@@ -95,6 +96,27 @@ _align_blank: int = 0
 BOUNDARY_SNAP_SEC = float(os.environ.get("BOUNDARY_SNAP_SEC", "0.3"))
 
 DEVICE_CONFIG = PROJECT_ROOT / "config" / "input_device.txt"
+
+
+@dataclass
+class DiarPipelineConfig:
+    """Knobs for the diarization pipeline. Defaults reflect the winning
+    'tuned' config from the diarization harness (experiments/dark_garden_tail):
+    raw audio to pyannote (loudnorm was flattening speaker embeddings), no
+    wav2vec2 alignment / boundary snap (made things worse AND 6x slower), and
+    tighter pyannote hyperparameters."""
+    audio_cleanup_for_diar: bool = False      # feed pyannote raw audio; Whisper still gets cleaned audio
+    align_words: bool = False                 # wav2vec2 forced alignment was net-negative in testing
+    snap_boundaries: bool = False             # boundary snap turned mushy mistakes into confident wrong attribution
+    min_turn_duration: float = 0.0            # post-assignment smoothing; 0 disables (didn't help in testing)
+    speaker_match_threshold: float = SPEAKER_MATCH_THRESHOLD
+    pyannote_model: str | None = None         # None = use env default in worker
+    clustering_threshold: float | None = 0.85 # tighter clustering keeps similar voices distinct
+    segmentation_min_duration_off: float | None = 0.5  # require longer silence to call a turn boundary
+    force_num_speakers: bool = False          # promote max/min speaker hint into exact num (no measurable effect, leave off)
+
+
+_DEFAULT_DIAR_CONFIG = DiarPipelineConfig()
 
 
 def _load_device_pref():
@@ -233,8 +255,9 @@ def load_model():
         log(f"GPU load failed ({e}) — falling back to CPU")
         _model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
         log("Model loaded on CPU")
-    # Preload alignment model so the first diarized chunk doesn't pay the cost.
-    _load_align_model()
+    # Note: wav2vec2 alignment model is no longer preloaded — the production
+    # diarization defaults disabled it (it was net-negative for quality and
+    # 6x slower). It still lazy-loads on first call if a caller opts in.
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +308,11 @@ def _align_words_wav2vec2(
     misattribution at speaker transitions. CTC forced alignment gives ~20 ms
     accurate edges instead. Falls back to original timestamps on any failure.
     """
-    if not words or _align_model is None:
+    if not words:
+        return words
+    if _align_model is None:
+        _load_align_model()
+    if _align_model is None:
         return words
     try:
         import torch
@@ -897,6 +924,80 @@ def _words_to_turns(
     return turns
 
 
+def _smooth_short_turns(
+    annotated: list[tuple[float, float, str, str | None]],
+    min_dur: float,
+) -> list[tuple[float, float, str, str | None]]:
+    """Reassign words inside any speaker run shorter than `min_dur` to the
+    longer-running neighbor. Operates on the per-word annotation so the regrouping
+    that `_words_to_turns` does naturally absorbs the smoothed words. Runs of
+    speaker None are left alone (dropped later)."""
+    if min_dur <= 0 or not annotated:
+        return annotated
+    # Build runs of same-speaker words.
+    runs: list[list[int]] = []  # each run is a list of indices into `annotated`
+    cur: list[int] = []
+    cur_spk: str | None = None
+    for i, (_, _, _, spk) in enumerate(annotated):
+        if spk != cur_spk:
+            if cur:
+                runs.append(cur)
+            cur = [i]
+            cur_spk = spk
+        else:
+            cur.append(i)
+    if cur:
+        runs.append(cur)
+
+    def run_dur(run: list[int]) -> float:
+        return annotated[run[-1]][1] - annotated[run[0]][0]
+
+    def run_spk(run: list[int]) -> str | None:
+        return annotated[run[0]][3]
+
+    # Reassign too-short runs to the longer neighbor.
+    changed = True
+    while changed:
+        changed = False
+        for ri, run in enumerate(runs):
+            if run_spk(run) is None:
+                continue
+            if run_dur(run) >= min_dur:
+                continue
+            left = runs[ri - 1] if ri > 0 and run_spk(runs[ri - 1]) is not None else None
+            right = runs[ri + 1] if ri + 1 < len(runs) and run_spk(runs[ri + 1]) is not None else None
+            target_spk: str | None = None
+            if left is not None and right is not None:
+                target_spk = run_spk(left if run_dur(left) >= run_dur(right) else right)
+            elif left is not None:
+                target_spk = run_spk(left)
+            elif right is not None:
+                target_spk = run_spk(right)
+            if target_spk is not None:
+                for i in run:
+                    ws, we, wt, _ = annotated[i]
+                    annotated[i] = (ws, we, wt, target_spk)
+                changed = True
+                break  # rebuild runs and re-scan
+        if changed:
+            # Rebuild runs after a merge so neighbor lookups stay correct.
+            runs = []
+            cur = []
+            cur_spk = None
+            for i, (_, _, _, spk) in enumerate(annotated):
+                if spk != cur_spk:
+                    if cur:
+                        runs.append(cur)
+                    cur = [i]
+                    cur_spk = spk
+                else:
+                    cur.append(i)
+            if cur:
+                runs.append(cur)
+
+    return annotated
+
+
 # ---------------------------------------------------------------------------
 # Diarization via isolated subprocess (GPU-safe — no ctranslate2 DLL conflict)
 # ---------------------------------------------------------------------------
@@ -920,6 +1021,7 @@ def _diarize_wav(
     use_cpu: bool = False,
     speaker_hint: dict | None = None,
     silero_vad: bool = False,
+    config: DiarPipelineConfig | None = None,
 ) -> tuple[list[tuple[float, float, str]], dict[str, np.ndarray]]:
     """Run diarization subprocess. Returns (segments, embeddings_by_local_label).
 
@@ -930,20 +1032,37 @@ def _diarize_wav(
     `embeddings_by_local_label` maps each chunk-local SPEAKER_xx to its 1-D numpy
     embedding vector, or is empty if the pipeline didn't return embeddings.
     """
+    cfg = config or _DEFAULT_DIAR_CONFIG
     cmd = [sys.executable, str(DIARIZE_WORKER), str(wav_path)]
     if use_cpu:
         cmd.append("--cpu")
     if silero_vad:
         cmd.append("--silero-vad")
 
-    if speaker_hint:
-        if speaker_hint.get("num_speakers") is not None:
-            cmd += ["--num-speakers", str(int(speaker_hint["num_speakers"]))]
+    # cfg.force_num_speakers promotes max/min hints to an exact num_speakers
+    # so pyannote treats the count as a hard constraint instead of a cap.
+    eff_hint = dict(speaker_hint) if speaker_hint else {}
+    if cfg.force_num_speakers and eff_hint.get("num_speakers") is None:
+        for k in ("max_speakers", "min_speakers"):
+            if eff_hint.get(k) is not None:
+                eff_hint = {"num_speakers": int(eff_hint[k])}
+                break
+
+    if eff_hint:
+        if eff_hint.get("num_speakers") is not None:
+            cmd += ["--num-speakers", str(int(eff_hint["num_speakers"]))]
         else:
-            if speaker_hint.get("min_speakers") is not None:
-                cmd += ["--min-speakers", str(int(speaker_hint["min_speakers"]))]
-            if speaker_hint.get("max_speakers") is not None:
-                cmd += ["--max-speakers", str(int(speaker_hint["max_speakers"]))]
+            if eff_hint.get("min_speakers") is not None:
+                cmd += ["--min-speakers", str(int(eff_hint["min_speakers"]))]
+            if eff_hint.get("max_speakers") is not None:
+                cmd += ["--max-speakers", str(int(eff_hint["max_speakers"]))]
+
+    if cfg.pyannote_model:
+        cmd += ["--model", cfg.pyannote_model]
+    if cfg.clustering_threshold is not None:
+        cmd += ["--clustering-threshold", str(float(cfg.clustering_threshold))]
+    if cfg.segmentation_min_duration_off is not None:
+        cmd += ["--segmentation-min-duration-off", str(float(cfg.segmentation_min_duration_off))]
 
     env = {**os.environ}
     token = _load_hf_token()
@@ -1160,6 +1279,46 @@ def _emit_turns_to_lines(
             carry["parts"] = [text]
 
 
+def _record_turn_jsonl(
+    annotated: list[tuple[float, float, str, str | None]],
+    chunk_offset: float,
+    out: list[dict],
+) -> None:
+    """Append per-turn dicts (with start, end, speaker, text) to `out`. Used by
+    the experiment harness so metrics like mid_sentence_swaps can use real
+    end-times instead of inferring them from the formatted .txt."""
+    cur_spk: str | None = None
+    cur_start: float = 0.0
+    cur_end: float = 0.0
+    cur_parts: list[str] = []
+
+    def flush():
+        if cur_spk is None:
+            return
+        text = "".join(cur_parts).strip()
+        if text:
+            out.append({
+                "start": cur_start + chunk_offset,
+                "end": cur_end + chunk_offset,
+                "speaker": cur_spk,
+                "text": text,
+            })
+
+    for ws, we, wt, spk in annotated:
+        if spk is None:
+            continue
+        if spk != cur_spk:
+            flush()
+            cur_spk = spk
+            cur_start = ws
+            cur_end = we
+            cur_parts = [wt]
+        else:
+            cur_end = we
+            cur_parts.append(wt)
+    flush()
+
+
 def _flush_carry(merged_lines: list[str], carry: dict) -> None:
     if carry["speaker"] is None:
         return
@@ -1181,7 +1340,17 @@ def transcribe_file_diarized(
     audio_cleanup: bool = False,
     silence_aware: bool = False,
     silero_vad: bool = False,
+    config: DiarPipelineConfig | None = None,
+    return_jsonl: bool = False,
 ):
+    """Diarize a file, writing the formatted .txt to `out`.
+
+    When `return_jsonl=True`, also returns a list of {"start","end","speaker","text"}
+    dicts (one per emitted turn) so the experiment harness can compute metrics
+    without re-parsing the formatted .txt. Default behavior (no config, no
+    return_jsonl) is identical to the pre-refactor implementation.
+    """
+    cfg = config or _DEFAULT_DIAR_CONFIG
     log(f"Diarized file job started: {p.name}")
     if speaker_hint:
         log(f"Speaker hint: {speaker_hint}")
@@ -1196,14 +1365,29 @@ def transcribe_file_diarized(
             audio_cleanup=audio_cleanup, silence_aware=silence_aware,
             progress=progress,
         )
+
+        # Optional parallel raw-audio chunks for pyannote when the caller wants
+        # Whisper to see cleaned audio but pyannote to see untouched audio.
+        diar_chunks = chunks
+        if audio_cleanup and not cfg.audio_cleanup_for_diar:
+            raw_dir = tmpdir / "raw_for_diar"
+            raw_dir.mkdir(exist_ok=True)
+            progress("Splitting raw audio for diarization ...")
+            diar_chunks = split(
+                p, raw_dir,
+                audio_cleanup=False, silence_aware=silence_aware,
+                progress=progress,
+            )
+
         total = len(chunks)
         w = len(str(total))
         t0 = time.time()
 
-        tracker = GlobalSpeakerTracker()
+        tracker = GlobalSpeakerTracker(threshold=cfg.speaker_match_threshold)
         merged_lines: list[str] = []
         carry: dict = {"speaker": None, "start": 0.0, "parts": []}
         chunk_offset = 0.0
+        turn_records: list[dict] = []
 
         for idx, chunk in enumerate(chunks, 1):
             elapsed_pre = time.time() - t0
@@ -1216,8 +1400,10 @@ def transcribe_file_diarized(
                 f"  |  elapsed {fmt_elapsed(elapsed_pre)}{eta_str}"
             )
 
+            diar_chunk = diar_chunks[idx - 1] if idx - 1 < len(diar_chunks) else chunk
             diar_segs, emb_by_label = _diarize_wav(
-                chunk, speaker_hint=speaker_hint, silero_vad=silero_vad
+                diar_chunk, speaker_hint=speaker_hint, silero_vad=silero_vad,
+                config=cfg,
             )
             active = [s for s in diar_segs if s[1] - s[0] >= 0.15]
 
@@ -1239,14 +1425,17 @@ def transcribe_file_diarized(
             )
 
             # One Whisper call per chunk instead of one per diar segment.
-            # align=True refines word edges via wav2vec2 forced alignment so
-            # max-overlap assignment doesn't misattribute boundary words.
-            words = _whisper_words(chunk, align=True)
-            # Snap pyannote turn boundaries to nearby word edges so no word
-            # straddles a speaker change.
-            global_segs = _snap_diar_boundaries_to_words(global_segs, words)
+            words = _whisper_words(chunk, align=cfg.align_words)
+            if cfg.snap_boundaries:
+                global_segs = _snap_diar_boundaries_to_words(global_segs, words)
             annotated = _assign_words_to_diar(words, global_segs)
+            if cfg.min_turn_duration > 0:
+                annotated = _smooth_short_turns(annotated, cfg.min_turn_duration)
             turns = _words_to_turns(annotated, chunk_offset)
+            if return_jsonl:
+                # Capture per-turn end time before merging across chunks. We
+                # reconstruct end as the last word's end + chunk_offset.
+                _record_turn_jsonl(annotated, chunk_offset, turn_records)
             _emit_turns_to_lines(turns, merged_lines, carry)
 
             # Advance chunk offset using the actual decoded chunk duration.
@@ -1269,6 +1458,9 @@ def transcribe_file_diarized(
             f"-> {out.name}  ({len(tracker._names)} speaker(s))"
         )
 
+        if return_jsonl:
+            return turn_records
+
     finally:
         _cleanup_tmp(tmpdir)
 
@@ -1285,6 +1477,7 @@ def transcribe_file_multi_track(
     audio_cleanup: bool = False,
     silence_aware: bool = False,
     silero_vad: bool = False,
+    config: DiarPipelineConfig | None = None,
 ):
     """Transcribe a file with independent per-speaker audio tracks.
 
@@ -1299,6 +1492,7 @@ def transcribe_file_multi_track(
       - None (auto-diarize within that track; pyannote picks the count)
     Missing / extra entries default to 1 (single speaker).
     """
+    cfg = config or _DEFAULT_DIAR_CONFIG
     tracks = _speaker_tracks_for(p)
     if not tracks:
         raise RuntimeError(
@@ -1371,7 +1565,9 @@ def transcribe_file_multi_track(
                 sub_hint: dict | None = {"max_speakers": hint} if isinstance(hint, int) and hint >= 2 else None
                 track_state.append({
                     "kind": "diar",
-                    "tracker": GlobalSpeakerTracker(labeler=labeler),
+                    "tracker": GlobalSpeakerTracker(
+                        threshold=cfg.speaker_match_threshold, labeler=labeler,
+                    ),
                     "sub_hint": sub_hint,
                 })
 
@@ -1402,7 +1598,10 @@ def transcribe_file_multi_track(
                 state = track_state[t_idx]
                 # Solo tracks don't need refined word edges (no boundary to
                 # cross), so only pay the alignment cost on diarized tracks.
-                words = _whisper_words(chunk_path, align=(state["kind"] != "solo"))
+                words = _whisper_words(
+                    chunk_path,
+                    align=(state["kind"] != "solo" and cfg.align_words),
+                )
                 if not words:
                     continue
 
@@ -1418,6 +1617,7 @@ def transcribe_file_multi_track(
                         chunk_path,
                         speaker_hint=state["sub_hint"],
                         silero_vad=silero_vad,
+                        config=cfg,
                     )
                     active = [s for s in diar_segs if s[1] - s[0] >= 0.15]
 
@@ -1431,14 +1631,16 @@ def transcribe_file_multi_track(
                         (s, e, local_to_global[spk]) for (s, e, spk) in active
                     ]
                     global_segs.sort(key=lambda x: x[0])
-                    # Snap turn boundaries to word edges before assignment.
-                    global_segs = _snap_diar_boundaries_to_words(global_segs, words)
+                    if cfg.snap_boundaries:
+                        global_segs = _snap_diar_boundaries_to_words(global_segs, words)
 
                     annotated = _assign_words_to_diar(words, global_segs)
                     for ws, we, wt, spk in annotated:
                         all_words.append((ws, we, wt, spk))
 
             all_words.sort(key=lambda x: x[0])
+            if cfg.min_turn_duration > 0:
+                all_words = _smooth_short_turns(all_words, cfg.min_turn_duration)
             turns = _words_to_turns(all_words, chunk_offset)
             _emit_turns_to_lines(turns, merged_lines, carry)
 

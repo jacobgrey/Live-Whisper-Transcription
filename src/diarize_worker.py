@@ -46,6 +46,12 @@ def _parse_args(argv):
     p.add_argument("--num-speakers", type=int, default=None)
     p.add_argument("--min-speakers", type=int, default=None)
     p.add_argument("--max-speakers", type=int, default=None)
+    p.add_argument("--model", default=None,
+                   help="override pyannote model (else $PYANNOTE_MODEL)")
+    p.add_argument("--clustering-threshold", type=float, default=None,
+                   help="override pipeline.clustering.threshold")
+    p.add_argument("--segmentation-min-duration-off", type=float, default=None,
+                   help="override pipeline.segmentation.min_duration_off")
     return p.parse_args(argv)
 
 
@@ -108,7 +114,7 @@ def main():
         print(json.dumps({"error": "missing Hugging Face token"}))
         sys.exit(1)
 
-    model_name = os.environ.get(
+    model_name = args.model or os.environ.get(
         "PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1"
     )
 
@@ -135,6 +141,24 @@ def main():
     except Exception as e:
         print(json.dumps({"error": f"pipeline load failed: {e}"}))
         sys.exit(1)
+
+    # Apply hyperparameter overrides if requested. Wrap in try/except: knob
+    # names differ between pipeline versions and a bad override should fall
+    # back to defaults rather than crash the whole run.
+    overrides: dict = {}
+    if args.clustering_threshold is not None:
+        overrides["clustering"] = {"threshold": args.clustering_threshold}
+    if args.segmentation_min_duration_off is not None:
+        overrides.setdefault("segmentation", {})
+        overrides["segmentation"]["min_duration_off"] = args.segmentation_min_duration_off
+    if overrides:
+        try:
+            pipeline.instantiate(overrides)
+        except Exception as e:
+            sys.stderr.write(
+                f"[diarize_worker] hyperparameter override failed ({e}); "
+                f"using pipeline defaults\n"
+            )
 
     # Move to GPU unless caller requested CPU fallback.
     if not use_cpu and torch.cuda.is_available():
