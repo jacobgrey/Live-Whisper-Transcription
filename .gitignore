@@ -25,5 +25,13 @@ Troubleshooting/
 # Transcription output
 transcripts/
 
+# Experiment artifacts (user audio + per-recording output dirs; harness .py files stay tracked)
+experiments/*.wav
+experiments/*.mp3
+experiments/*.m4a
+experiments/*.flac
+experiments/*.mka
+experiments/*/
+
 # Claude
 .claude/
