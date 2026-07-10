@@ -82,3 +82,9 @@ F9::
 {
     RunWait('"' py '" "' client '" SHUTDOWN', , "Hide")
 }
+
+; Quit this AHK script
++F9::
+{
+    ExitApp()
+}
