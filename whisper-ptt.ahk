@@ -97,7 +97,7 @@ F6::
 }
 
 ; Toggle suspend (disables/re-enables every hotkey above except these two)
-#SuspendExempt True
+#SuspendExempt On
 ^+F9::Suspend()
 ^+F7::Suspend()
-#SuspendExempt False
+#SuspendExempt Off
