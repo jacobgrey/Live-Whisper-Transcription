@@ -14,6 +14,10 @@ rem PyTorch ships its own CUDA/cuDNN DLLs here. Put this FIRST.
 set "TORCH_LIB=%ROOT%\venv\Lib\site-packages\torch\lib"
 set "PATH=%TORCH_LIB%;%PATH%"
 
+rem ffmpeg is installed project-local (tools\ffmpeg), not system-wide.
+set "FFMPEG_BIN=%ROOT%\tools\ffmpeg"
+set "PATH=%FFMPEG_BIN%;%PATH%"
+
 rem Auto-detect CUDA toolkit bin (optional, PyTorch bundles its own CUDA libs)
 set "CUDA_BIN="
 for /d %%D in ("C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*") do set "CUDA_BIN=%%~D\bin"

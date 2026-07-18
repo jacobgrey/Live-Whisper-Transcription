@@ -33,15 +33,16 @@ ptt/
 │   └── diarize_worker.py       # Isolated diarization subprocess
 ├── scripts/                    # Windows batch scripts
 │   ├── start_daemon.cmd        # Launches daemon with CUDA env setup
-│   ├── Transcribe Drop.cmd     # Drag-drop wrapper for transcribe_drop.py
-│   └── rebuild_whisper_env.cmd # Recreates venv with pinned deps
+│   └── Transcribe Drop.cmd     # Drag-drop wrapper for transcribe_drop.py
 ├── config/                     # Configuration and dependency files
 │   ├── requirements.txt        # Core Python dependencies
 │   ├── requirements-diarize.txt # Diarization dependencies
 │   ├── constraints.txt         # Torch version pins (generated, gitignored)
 │   └── hf_token.txt            # HF API token (gitignored)
-├── setup.cmd                   # One-click installer (detects GPU, installs everything)
+├── setup.ps1                   # Installer (uv-based, transparent, detects GPU)
+├── setup.cmd                   # Thin double-click wrapper around setup.ps1
 ├── whisper-ptt.ahk             # AutoHotKey v2.0+ hotkeys (F7/F8/F9)
+├── tools/ffmpeg/                # ffmpeg, project-local (gitignored, not on system PATH)
 └── venv/                       # Python 3.10 virtual environment (gitignored)
 ```
 
@@ -52,8 +53,8 @@ ptt/
 - **src/transcribe_drop.py** — User-facing batch interface. Prompts for diarization, subfolders, structure mirroring. Streams progress from daemon.
 - **src/whisper_client.py** — Minimal TCP client for sending commands to daemon.
 - **whisper-ptt.ahk** — AutoHotKey v2.0+ hotkeys: F8 (hold=record, release=transcribe+paste), F7 (start daemon), F9 (shutdown). Uses `A_ScriptDir` for portable paths.
-- **scripts/start_daemon.cmd** — Launches daemon with CUDA env vars and PyTorch DLL path setup.
-- **scripts/rebuild_whisper_env.cmd** — Recreates the Python 3.10 venv with all pinned dependencies.
+- **scripts/start_daemon.cmd** — Launches daemon with CUDA env vars, PyTorch DLL path, and project-local ffmpeg PATH setup.
+- **setup.ps1** — Also handles venv rebuilds via `-Rebuild` (recreates the Python 3.10 venv with all pinned dependencies).
 
 ## Socket Protocol
 
@@ -61,16 +62,20 @@ Line-delimited text over TCP. Commands: `PING`, `START`, `STOP`, `TRANSCRIBE_FIL
 
 ## Installation
 
-Run `setup.cmd` (double-click or from terminal). It will:
-1. Verify Python 3.10 and ffmpeg are installed
+Run `setup.ps1` (or double-click `setup.cmd`, a thin wrapper around it). It shows a full plan of what it's about to do and asks for one confirmation before doing anything — no silent/passive installer flags anywhere. It will:
+1. Check for `uv` (hard prerequisite — the script errors out with install instructions if missing, it does not bootstrap `uv` itself)
 2. Detect NVIDIA GPU — installs CUDA PyTorch if found, CPU-only otherwise
-3. Create venv and install all dependencies
-4. Prompt for HuggingFace token (needed for diarization)
-5. Install AutoHotKey v2 if not found
+3. Provision Python 3.10 via `uv python install 3.10` and create `venv/` via `uv venv` — both project-local, nothing registered machine-wide
+4. Download ffmpeg into `tools/ffmpeg/` — project-local, never added to the system PATH
+5. Install all dependencies into the venv via `uv pip install`
+6. Prompt for a HuggingFace token (needed for diarization)
+7. Install AutoHotKey v2 if not found — the **only** system-wide install, since it has to run as a global hotkey daemon; its installer runs interactively (no `/silent`), so you'll see and click through its wizard
 
-Prerequisites the user must install manually: **Python 3.10** and **ffmpeg** (must be in PATH).
+Pass `-Rebuild` to wipe and recreate `venv/` from scratch (replaces the old `rebuild_whisper_env.cmd`).
 
-All paths are portable — scripts auto-detect their location via `%~dp0` (cmd) and `A_ScriptDir` (AHK). CUDA toolkit is auto-detected from standard install locations.
+Prerequisites the user must install manually: **uv** and, optionally, an **NVIDIA driver** for GPU acceleration.
+
+All paths are portable — scripts auto-detect their location via `$PSScriptRoot`/`%~dp0` (cmd) and `A_ScriptDir` (AHK). `scripts\start_daemon.cmd` prepends both `venv\Lib\site-packages\torch\lib` and `tools\ffmpeg\` to its own session PATH so the daemon (and its `diarize_worker.py` subprocess) can find CUDA DLLs and ffmpeg without either being installed globally. CUDA toolkit is auto-detected from standard install locations.
 
 ## Running the System
 
@@ -85,7 +90,7 @@ python src/whisper_client.py PING
 python src/whisper_client.py SHUTDOWN
 
 # Rebuild venv from scratch
-scripts/rebuild_whisper_env.cmd
+setup.ps1 -Rebuild
 ```
 
 All Python commands should use the venv at `./venv/`. The `start_daemon.cmd` script handles venv activation and CUDA environment setup.

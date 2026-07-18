@@ -6,7 +6,7 @@ if (-not $Inputs -or $Inputs.Count -eq 0) {
 }
 
 $ErrorActionPreference = 'Stop'
-$ffmpeg = 'C:\ffmpeg\bin\ffmpeg.exe'
+$ffmpeg = Join-Path $PSScriptRoot '..\tools\ffmpeg\ffmpeg.exe'
 
 if (-not (Test-Path -LiteralPath $ffmpeg)) {
     Write-Host "ffmpeg not found at $ffmpeg" -ForegroundColor Red

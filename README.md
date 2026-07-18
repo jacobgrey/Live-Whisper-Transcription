@@ -10,20 +10,18 @@ Local speech-to-text for Windows using [faster-whisper](https://github.com/SYSTR
 
 ## Quick Start
 
-1. Download **[setup.cmd](https://raw.githubusercontent.com/jacobgrey/Live-Whisper-Transcription/main/setup.cmd)**
-2. Put it in the folder where you want the app installed
-3. Double-click it
+1. Clone this repo: `git clone https://github.com/jacobgrey/Live-Whisper-Transcription.git`
+2. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you don't already have it — the only prerequisite this doesn't install for you
+3. Run `setup.ps1` (or double-click `setup.cmd`, a thin wrapper around it)
 
-That's it. The setup script automatically:
-- Downloads the project files from GitHub
-- Installs Python 3.10, ffmpeg, and AutoHotKey v2 if not already present
+The setup script:
+- Shows a full plan of exactly what it's about to do and asks for one confirmation before touching anything — no silent installs
+- Provisions Python 3.10 and creates the virtual environment via `uv`, and downloads ffmpeg — all **project-local**, nothing added to your system PATH
 - Detects your GPU and installs the right version of PyTorch (CUDA or CPU-only)
-- Creates a Python virtual environment with all dependencies
-- Prompts for a HuggingFace token (needed for speaker diarization) if diarization is selected as an installed option.
+- Installs AutoHotKey v2 if not already present — the only thing installed system-wide (it needs to run as a global hotkey daemon); its installer runs normally, so you'll see and click through the wizard yourself
+- Prompts for a HuggingFace token (needed for speaker diarization) if diarization is selected as an installed option
 
-Before anything is installed, you'll see a summary of what will be set up and can cancel.
-
-> Alternatively, you can clone this repo and run `setup.cmd` from inside it.
+Run `setup.ps1 -Rebuild` any time to wipe and recreate the virtual environment from scratch.
 
 ## Usage
 
@@ -80,10 +78,11 @@ The diarization worker runs as an isolated subprocess to avoid CUDA DLL conflict
 ## System Requirements
 
 - **OS:** Windows 10 or 11
+- **[uv](https://docs.astral.sh/uv/getting-started/installation/)** — used to provision Python and the project's virtual environment
 - **GPU (optional):** NVIDIA GPU with CUDA support (~2 GB VRAM for the Whisper model)
 - **CPU mode:** Works on any machine, just slower
 
-The setup script handles all other dependencies automatically.
+The setup script handles everything else automatically — Python, ffmpeg, and dependencies are all project-local. AutoHotKey v2 is the only system-wide install, and only if push-to-talk hotkeys are used.
 
 ## Troubleshooting
 
