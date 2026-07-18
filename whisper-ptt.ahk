@@ -89,15 +89,11 @@ F9::
     ExitApp()
 }
 
-; Open a terminal at the project folder
-F6::
-{
-    try Run('wt.exe -d "' A_ScriptDir '"')
-    catch Run('cmd.exe /K cd /d "' A_ScriptDir '"')
-}
-
 ; Toggle suspend (disables/re-enables every hotkey above except these two)
-#SuspendExempt On
-^+F9::Suspend()
-^+F7::Suspend()
-#SuspendExempt Off
+; #SuspendExempt keeps the hotkeys immediately below it active even while
+; suspended - otherwise there'd be no way to un-suspend. Per AutoHotkey v2
+; docs: https://www.autohotkey.com/docs/v2/lib/_SuspendExempt.htm
+#SuspendExempt
+^+F9::Suspend
+^+F7::Suspend
+#SuspendExempt False

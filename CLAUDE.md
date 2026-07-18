@@ -41,7 +41,7 @@ ptt/
 │   └── hf_token.txt            # HF API token (gitignored)
 ├── setup.ps1                   # Installer (uv-based, transparent, detects GPU)
 ├── setup.cmd                   # Thin double-click wrapper around setup.ps1
-├── whisper-ptt.ahk             # AutoHotKey v2.0+ hotkeys (F6/F7/F8/F9/Ctrl+Shift+F7/F9)
+├── whisper-ptt.ahk             # AutoHotKey v2.0+ hotkeys (F7/F8/F9/Ctrl+Shift+F7/F9)
 ├── tools/ffmpeg/                # ffmpeg, project-local (gitignored, not on system PATH)
 └── venv/                       # Python 3.10 virtual environment (gitignored)
 ```
@@ -52,7 +52,7 @@ ptt/
 - **src/diarize_worker.py** — Isolated subprocess for speaker diarization. Takes a WAV path, outputs JSON speaker segments. **No ctranslate2 imports allowed here.**
 - **src/transcribe_drop.py** — User-facing batch interface. Prompts for diarization, subfolders, structure mirroring. Streams progress from daemon.
 - **src/whisper_client.py** — Minimal TCP client for sending commands to daemon.
-- **whisper-ptt.ahk** — AutoHotKey v2.0+ hotkeys: F8 (hold=record, release=transcribe+paste), F7 (start daemon, Shift+F7 to pick input device), F9 (shutdown daemon, Shift+F9 quits the script), F6 (open a terminal at the project folder), Ctrl+Shift+F7/F9 (toggle-suspend all other hotkeys - kept active via `#SuspendExempt` so you can always un-suspend). Uses `A_ScriptDir` for portable paths.
+- **whisper-ptt.ahk** — AutoHotKey v2.0+ hotkeys: F8 (hold=record, release=transcribe+paste), F7 (start daemon, Shift+F7 to pick input device), F9 (shutdown daemon, Shift+F9 quits the script), Ctrl+Shift+F7/F9 (toggle-suspend all other hotkeys - kept active via `#SuspendExempt` so you can always un-suspend). Uses `A_ScriptDir` for portable paths.
 - **scripts/start_daemon.cmd** — Launches daemon with CUDA env vars, PyTorch DLL path, and project-local ffmpeg PATH setup.
 - **setup.ps1** — Also handles venv rebuilds via `-Rebuild` (recreates the Python 3.10 venv with all pinned dependencies).
 
