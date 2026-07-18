@@ -21,6 +21,13 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 
+# uv's `-c`/`--constraints` flag mishandles absolute paths that contain a
+# space (confirmed independent of PowerShell - reproduces via cmd.exe too).
+# Running from the project root and using paths relative to it for every
+# uv invocation sidesteps the bug entirely, since none of those relative
+# fragments (e.g. "config\constraints.txt") ever contain a space.
+Set-Location -Path $Root
+
 function Write-Banner($text) {
     Write-Host ""
     Write-Host ("=" * 60)
@@ -31,11 +38,10 @@ function Write-Banner($text) {
 Write-Banner "Whisper Speech-to-Text - Setup"
 
 if ($Rebuild) {
-    $venvPath = Join-Path $Root "venv"
-    if (Test-Path $venvPath) {
+    if (Test-Path "venv") {
         Write-Host ""
-        Write-Host "Rebuild requested: removing existing venv ($venvPath)..."
-        Remove-Item -Recurse -Force $venvPath
+        Write-Host "Rebuild requested: removing existing venv ($Root\venv)..."
+        Remove-Item -Recurse -Force "venv"
     }
 }
 
@@ -73,12 +79,14 @@ if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
 }
 
 # --- Existing project-local venv / ffmpeg ---
-$VenvPath = Join-Path $Root "venv"
-$VenvPy = Join-Path $VenvPath "Scripts\python.exe"
+# Paths below are relative to $Root (see Set-Location above) so they never
+# contain a space, regardless of the install folder's own name.
+$VenvPath = "venv"
+$VenvPy = "venv\Scripts\python.exe"
 $needVenv = -not (Test-Path $VenvPy)
 
-$FfmpegDir = Join-Path $Root "tools\ffmpeg"
-$FfmpegExe = Join-Path $FfmpegDir "ffmpeg.exe"
+$FfmpegDir = "tools\ffmpeg"
+$FfmpegExe = "tools\ffmpeg\ffmpeg.exe"
 $needFfmpeg = -not (Test-Path $FfmpegExe)
 
 # --- Ask about diarization ---
@@ -208,9 +216,9 @@ if ($needVenv) {
 Write-Host ""
 
 # --- PyTorch (GPU or CPU variant) ---
-$ConstraintsFile = Join-Path $Root "config\constraints.txt"
-$RequirementsFile = Join-Path $Root "config\requirements.txt"
-$RequirementsDiarizeFile = Join-Path $Root "config\requirements-diarize.txt"
+$ConstraintsFile = "config\constraints.txt"
+$RequirementsFile = "config\requirements.txt"
+$RequirementsDiarizeFile = "config\requirements-diarize.txt"
 
 $needTorch = $needVenv
 if (-not $needTorch) {
@@ -246,7 +254,7 @@ if ($needTorch) {
 }
 
 # --- Core dependencies ---
-$CoreMarker = Join-Path $VenvPath ".deps_core_installed"
+$CoreMarker = "venv\.deps_core_installed"
 $needCoreDeps = $true
 if ((Test-Path $CoreMarker) -and -not $needTorch) {
     if ((Get-Content $RequirementsFile -Raw) -eq (Get-Content $CoreMarker -Raw)) {
@@ -267,7 +275,7 @@ if ($needCoreDeps) {
 
 # --- Diarization dependencies (optional) ---
 if ($installDiarize) {
-    $DiarMarker = Join-Path $VenvPath ".deps_diarize_installed"
+    $DiarMarker = "venv\.deps_diarize_installed"
     $needDiarDeps = $true
     if ((Test-Path $DiarMarker) -and -not $needTorch) {
         if ((Get-Content $RequirementsDiarizeFile -Raw) -eq (Get-Content $DiarMarker -Raw)) {
@@ -305,7 +313,7 @@ if ($installDiarize) {
     setx PYANNOTE_MODEL pyannote/speaker-diarization-3.1 | Out-Null
     Write-Host ""
 
-    $HfTokenFile = Join-Path $Root "config\hf_token.txt"
+    $HfTokenFile = "config\hf_token.txt"
     if (-not (Test-Path $HfTokenFile)) {
         Write-Host "Diarization requires a HuggingFace API token."
         Write-Host "Get one at: https://huggingface.co/settings/tokens"
