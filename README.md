@@ -35,6 +35,8 @@ Run `scripts\start_daemon.cmd` (or press **F7** if the AHK script is running). T
 2. **Hold F8** to record from your microphone
 3. **Release F8** to transcribe and paste the text at your cursor
 4. **Press F9** to shut down the daemon and free memory
+5. **Press F6** to open a terminal at the project folder
+6. **Press Ctrl+Shift+F7 or Ctrl+Shift+F9** to suspend/resume all hotkeys above (useful if F8 etc. are interfering with another app) — these two keep working even while suspended
 
 ### Batch transcription
 

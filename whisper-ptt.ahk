@@ -88,3 +88,16 @@ F9::
 {
     ExitApp()
 }
+
+; Open a terminal at the project folder
+F6::
+{
+    try Run('wt.exe -d "' A_ScriptDir '"')
+    catch Run('cmd.exe /K cd /d "' A_ScriptDir '"')
+}
+
+; Toggle suspend (disables/re-enables every hotkey above except these two)
+#SuspendExempt True
+^+F9::Suspend()
+^+F7::Suspend()
+#SuspendExempt False
